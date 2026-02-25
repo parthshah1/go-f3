@@ -19,7 +19,7 @@ import (
 )
 
 type gpbftInputs struct {
-	manifest  *manifest.Manifest
+	manifest  manifest.Manifest
 	certStore *certstore.Store
 	ec        ec.Backend
 	verifier  gpbft.Verifier
@@ -28,7 +28,7 @@ type gpbftInputs struct {
 	ptCache *lru.Cache[string, cid.Cid]
 }
 
-func newInputs(manifest *manifest.Manifest, certStore *certstore.Store, ec ec.Backend,
+func newInputs(manifest manifest.Manifest, certStore *certstore.Store, ec ec.Backend,
 	verifier gpbft.Verifier, clk clock.Clock) gpbftInputs {
 	cache, err := lru.New[string, cid.Cid](256) // keep a bit more than 2x max ECChain size
 	if err != nil {
@@ -70,6 +70,12 @@ func (h *gpbftInputs) collectChain(ctx context.Context, base ec.TipSet, head ec.
 	// TODO: optimize when head is way beyond base
 	res := make([]ec.TipSet, 0, 2*gpbft.ChainMaxLen)
 	res = append(res, head)
+
+	// early escape to avoid reporting divergence in metrics
+	if head.Epoch() < base.Epoch() {
+		log.Debugw("head behind base, proposing just base", "head", head.String(), "base", base.String())
+		return nil, nil
+	}
 
 	current := head
 	for !bytes.Equal(current.Key(), base.Key()) {
@@ -185,7 +191,7 @@ func (h *gpbftInputs) GetProposal(ctx context.Context, instance uint64) (_ *gpbf
 
 func (h *gpbftInputs) GetCommittee(ctx context.Context, instance uint64) (_ *gpbft.Committee, _err error) {
 	defer func(start time.Time) {
-		metrics.committeeFetchTime.Record(context.TODO(), time.Since(start).Seconds(), metric.WithAttributes(attrStatusFromErr(_err)))
+		metrics.committeeFetchTime.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attrStatusFromErr(_err)))
 	}(time.Now())
 
 	var powerTsk gpbft.TipSetKey

@@ -46,7 +46,10 @@ var metrics = struct {
 	validatedMessages        metric.Int64Counter
 	partialMessages          metric.Int64UpDownCounter
 	partialMessageDuplicates metric.Int64Counter
+	partialMessagesDropped   metric.Int64Counter
 	partialMessageInstances  metric.Int64UpDownCounter
+	partialValidationCache   metric.Int64Counter
+	ecFinalizeTime           metric.Float64Histogram
 }{
 	headDiverged:      measurements.Must(meter.Int64Counter("f3_head_diverged", metric.WithDescription("Number of times we encountered the head has diverged from base scenario."))),
 	reconfigured:      measurements.Must(meter.Int64Counter("f3_reconfigured", metric.WithDescription("Number of times we reconfigured due to new manifest being delivered."))),
@@ -71,9 +74,18 @@ var metrics = struct {
 	partialMessages: measurements.Must(meter.Int64UpDownCounter("f3_partial_messages",
 		metric.WithDescription("Number of partial GPBFT messages pending fulfilment."))),
 	partialMessageDuplicates: measurements.Must(meter.Int64Counter("f3_partial_message_duplicates",
-		metric.WithDescription("Number of partial GPBFT messages recieved that already have an unfulfilled message for the same instance, sender, round and phase."))),
+		metric.WithDescription("Number of partial GPBFT messages received that already have an unfulfilled message for the same instance, sender, round and phase."))),
+	partialMessagesDropped: measurements.Must(meter.Int64Counter("f3_partial_messages_dropped",
+		metric.WithDescription("Number of partial GPBFT messages or chain broadcasts were dropped due to consumers being too slow."))),
 	partialMessageInstances: measurements.Must(meter.Int64UpDownCounter("f3_partial_message_instances",
 		metric.WithDescription("Number of instances with partial GPBFT messages pending fulfilment."))),
+	partialValidationCache: measurements.Must(meter.Int64Counter("f3_partial_validation_cache",
+		metric.WithDescription("The number of times partial validation cache resulted in hit or miss."))),
+	ecFinalizeTime: measurements.Must(meter.Float64Histogram("f3_ec_finalize_time",
+		metric.WithDescription("Histogram of the number of seconds spent checkpointing an F3 decision in EC tagged by status"),
+		metric.WithExplicitBucketBoundaries(0.001, 0.002, 0.003, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 10.0),
+		metric.WithUnit("s"),
+	)),
 }
 
 func recordValidatedMessage(ctx context.Context, msg gpbft.ValidatedMessage) {

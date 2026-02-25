@@ -10,12 +10,11 @@ import (
 var ErrNoPower = errors.New("no power")
 
 type MessageBuilder struct {
-	NetworkName      NetworkName
-	PowerTable       powerTableAccessor
-	Payload          Payload
-	BeaconForTicket  []byte
-	Justification    *Justification
-	SigningMarshaler SigningMarshaler
+	NetworkName     NetworkName
+	PowerTable      powerTableAccessor
+	Payload         Payload
+	BeaconForTicket []byte
+	Justification   *Justification
 }
 
 type powerTableAccessor interface {
@@ -64,7 +63,7 @@ func (mb *MessageBuilder) PrepareSigningInputs(id ActorID) (*SignatureBuilder, e
 		PubKey: pubKey,
 	}
 
-	sb.PayloadToSign = mb.SigningMarshaler.MarshalPayloadForSigning(mb.NetworkName, &mb.Payload)
+	sb.PayloadToSign = mb.Payload.MarshalForSigning(mb.NetworkName)
 	if mb.BeaconForTicket != nil {
 		sb.VRFToSign = vrfSerializeSigInput(mb.BeaconForTicket, mb.Payload.Instance, mb.Payload.Round, mb.NetworkName)
 	}
@@ -72,7 +71,7 @@ func (mb *MessageBuilder) PrepareSigningInputs(id ActorID) (*SignatureBuilder, e
 }
 
 // Sign creates the signed payload from the signature builder and returns the payload
-// and VRF signatures. These signatures can be used independent from the builder.
+// and VRF signatures. These signatures can be used independent of the builder.
 func (st *SignatureBuilder) Sign(ctx context.Context, signer Signer) ([]byte, []byte, error) {
 	payloadSignature, err := signer.Sign(ctx, st.PubKey, st.PayloadToSign)
 	if err != nil {

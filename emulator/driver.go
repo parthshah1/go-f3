@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/filecoin-project/go-f3/gpbft"
 	"github.com/stretchr/testify/require"
@@ -68,7 +69,7 @@ func (d *Driver) PeekLastBroadcastRequest() *gpbft.GMessage {
 
 func (d *Driver) DeliverAlarm() (bool, error) {
 	if d.host.maybeReceiveAlarm() {
-		return true, d.subject.ReceiveAlarm()
+		return true, d.subject.ReceiveAlarm(context.Background())
 	}
 	return false, nil
 }
@@ -88,7 +89,6 @@ func (d *Driver) prepareMessage(partialMessage *gpbft.GMessage) *gpbft.GMessage 
 
 	mb := instance.NewMessageBuilder(partialMessage.Vote, partialMessage.Justification, withValidTicket)
 	mb.NetworkName = d.host.NetworkName()
-	mb.SigningMarshaler = d.host
 	msg, err := mb.Build(context.Background(), d.host, partialMessage.Sender)
 	d.require.NoError(err)
 	d.require.NotNil(msg)
@@ -99,9 +99,19 @@ func (d *Driver) prepareMessage(partialMessage *gpbft.GMessage) *gpbft.GMessage 
 }
 
 func (d *Driver) deliverMessage(msg *gpbft.GMessage) error {
-	if validated, err := d.subject.ValidateMessage(msg); err != nil {
+	ctx := context.Background()
+	if validated, err := d.subject.ValidateMessage(ctx, msg); err != nil {
 		return err
 	} else {
-		return d.subject.ReceiveMessage(validated)
+		return d.subject.ReceiveMessage(ctx, validated)
 	}
+}
+
+// AdvanceTimeBy advances the current time of the driver by the given amount.
+// This allows the driver to simulate the passage of time in the emulated
+// gpbft.Participant. This is useful for testing timeouts and other time-based
+// behavior in the gpbft.Participant in high number of rounds, which
+// exponentially increases the phase timeout.
+func (d *Driver) AdvanceTimeBy(t time.Duration) {
+	d.host.now = d.host.now.Add(t)
 }

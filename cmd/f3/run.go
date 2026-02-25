@@ -9,7 +9,6 @@ import (
 	"github.com/filecoin-project/go-f3"
 	"github.com/filecoin-project/go-f3/gpbft"
 	"github.com/filecoin-project/go-f3/internal/consensus"
-	"github.com/filecoin-project/go-f3/manifest"
 	"github.com/filecoin-project/go-f3/sim/signing"
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	logging "github.com/ipfs/go-log/v2"
@@ -82,7 +81,7 @@ var runCmd = cli.Command{
 		}
 
 		// setup initial power table for number of participants
-		initialPowerTable := []gpbft.PowerEntry{}
+		var initialPowerTable []gpbft.PowerEntry
 		fsig := signing.NewFakeBackend()
 		for i := 0; i < c.Int("N"); i++ {
 			pubkey, _ := fsig.GenerateKey()
@@ -94,38 +93,17 @@ var runCmd = cli.Command{
 			})
 		}
 
-		// if the manifest-server ID is passed in a flag,
-		// we setup the monitoring system
-		mFlag := c.String("manifest-server")
-		var manifestServer peer.ID
-		var mprovider manifest.ManifestProvider
-		if mFlag != "" {
-			manifestServer, err = peer.Decode(mFlag)
-			if err != nil {
-				return fmt.Errorf("parsing manifest server ID: %w", err)
-			}
-			mprovider, err = manifest.NewDynamicManifestProvider(ps, manifestServer,
-				manifest.DynamicManifestProviderWithDatastore(ds),
-				manifest.DynamicManifestProviderWithInitialManifest(m),
-			)
-		} else {
-			mprovider, err = manifest.NewStaticManifestProvider(m)
-		}
-		if err != nil {
-			return fmt.Errorf("constructing manifest provider: %w", err)
-		}
-
 		signingBackend := &fakeSigner{*signing.NewFakeBackend()}
 		id := c.Uint64("id")
 		signingBackend.Allow(int(id))
 
-		ec := consensus.NewFakeEC(ctx,
+		ec := consensus.NewFakeEC(
 			consensus.WithBootstrapEpoch(m.BootstrapEpoch),
 			consensus.WithECPeriod(m.EC.Period),
 			consensus.WithInitialPowerTable(initialPowerTable),
 		)
 
-		module, err := f3.New(ctx, mprovider, ds, h, ps, signingBackend, ec, filepath.Join(tmpdir, "f3"))
+		module, err := f3.New(ctx, m, ds, h, ps, signingBackend, ec, filepath.Join(tmpdir, "f3"))
 		if err != nil {
 			return fmt.Errorf("creating module: %w", err)
 		}
@@ -192,12 +170,4 @@ func setupDiscovery(h host.Host) (closer func(), err error) {
 
 type fakeSigner struct {
 	signing.FakeBackend
-}
-
-// MarshalPayloadForSigning marshals the given payload into the bytes that should be signed.
-// This should usually call `Payload.MarshalForSigning(NetworkName)` except when testing as
-// that method is slow (computes a merkle tree that's necessary for testing).
-// Implementations must be safe for concurrent use.
-func (fs *fakeSigner) MarshalPayloadForSigning(nn gpbft.NetworkName, p *gpbft.Payload) []byte {
-	return p.MarshalForSigning(nn)
 }

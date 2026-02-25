@@ -2,6 +2,7 @@ package gpbft_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -100,19 +101,19 @@ func (pt *participantTestSubject) Log(format string, args ...any) {
 
 func (pt *participantTestSubject) expectBeginInstance() {
 	// Prepare the test host.
-	pt.host.On("GetProposal", pt.instance).Return(pt.supplementalData, pt.canonicalChain, nil)
-	pt.host.On("GetCommittee", pt.instance).Return(&gpbft.Committee{PowerTable: pt.powerTable, Beacon: pt.beacon}, nil).Once()
+	pt.host.On("GetProposal", mock.Anything, pt.instance).Return(pt.supplementalData, pt.canonicalChain, nil)
+	pt.host.On("GetCommittee", mock.Anything, pt.instance).Return(&gpbft.Committee{PowerTable: pt.powerTable, Beacon: pt.beacon}, nil).Once()
 	pt.host.On("Time").Return(pt.time)
 	// We need to use `Maybe` here because `MarshalPayloadForSigning` may be called
 	// an additional time for verification.
-	// Without the `Maybe` the tests immediately fails here:
+	// Without the `Maybe` the tests immediately fail here:
 	// https://github.com/filecoin-project/go-f3/blob/d27d281109d31485fc4ac103e2af58afb86c158f/gpbft/gpbft.go#L395
 	pt.host.On("MarshalPayloadForSigning", pt.networkName, mock.AnythingOfType("*gpbft.Payload")).
 		Return([]byte(gpbft.DomainSeparationTag + ":" + pt.networkName)).Maybe()
 
-	// Expect calls to get the host state prior to beginning of an instance.
-	pt.host.EXPECT().GetProposal(pt.instance)
-	pt.host.EXPECT().GetCommittee(pt.instance)
+	// Expect calls to get the host state prior to the beginning of an instance.
+	pt.host.EXPECT().GetProposal(mock.Anything, pt.instance)
+	pt.host.EXPECT().GetCommittee(mock.Anything, pt.instance)
 	pt.host.EXPECT().Time()
 
 	// Expect alarm is set to 2X of configured delta.
@@ -161,7 +162,7 @@ func (pt *participantTestSubject) requireStart() {
 func (pt *participantTestSubject) Start() error {
 	pt.host.EXPECT().SetAlarm(pt.time)
 	require.NoError(pt.t, pt.Participant.StartInstanceAt(pt.instance, pt.time))
-	return pt.ReceiveAlarm()
+	return pt.ReceiveAlarm(context.Background())
 }
 
 func (pt *participantTestSubject) assertHostExpectations() bool {
@@ -198,11 +199,11 @@ func (pt *participantTestSubject) mockValidTicket(target gpbft.PubKey, ticket gp
 }
 
 func (pt *participantTestSubject) mockCommitteeForInstance(instance uint64, powerTable *gpbft.PowerTable, beacon []byte) {
-	pt.host.On("GetCommittee", instance).Return(&gpbft.Committee{PowerTable: powerTable, Beacon: beacon}, nil).Once()
+	pt.host.On("GetCommittee", mock.Anything, instance).Return(&gpbft.Committee{PowerTable: powerTable, Beacon: beacon}, nil).Once()
 }
 
 func (pt *participantTestSubject) mockCommitteeUnavailableForInstance(instance uint64) {
-	pt.host.On("GetCommittee", instance).Return(nil, errors.New("committee not available"))
+	pt.host.On("GetCommittee", mock.Anything, instance).Return(nil, errors.New("committee not available"))
 }
 
 func (pt *participantTestSubject) matchMessageSigningPayload() any {
@@ -227,27 +228,28 @@ func TestParticipant(t *testing.T) {
 	t.Parallel()
 	const seed = 984651320
 	signature := []byte("barreleye")
+	ctx := context.Background()
 
 	t.Run("panic is recovered", func(t *testing.T) {
 		t.Run("on Start", func(t *testing.T) {
 			subject := newParticipantTestSubject(t, seed, 0)
-			subject.host.On("GetProposal", subject.instance).Panic("saw me no chain")
+			subject.host.On("GetProposal", mock.Anything, subject.instance).Panic("saw me no chain")
 			require.NotPanics(t, func() {
 				require.ErrorContains(t, subject.Start(), "saw me no chain")
 			})
 		})
 		t.Run("on ReceiveAlarm", func(t *testing.T) {
 			subject := newParticipantTestSubject(t, seed, 0)
-			subject.host.On("GetProposal", subject.instance).Panic("saw me no chain")
+			subject.host.On("GetProposal", mock.Anything, subject.instance).Panic("saw me no chain")
 			require.NotPanics(t, func() {
-				require.ErrorContains(t, subject.ReceiveAlarm(), "saw me no chain")
+				require.ErrorContains(t, subject.ReceiveAlarm(ctx), "saw me no chain")
 			})
 		})
 		t.Run("on ValidateMessage", func(t *testing.T) {
 			subject := newParticipantTestSubject(t, seed, 0)
 			subject.requireStart()
 			require.NotPanics(t, func() {
-				gotValidated, gotErr := subject.ValidateMessage(nil)
+				gotValidated, gotErr := subject.ValidateMessage(ctx, nil)
 				require.Nil(t, gotValidated)
 				require.Error(t, gotErr)
 			})
@@ -256,7 +258,7 @@ func TestParticipant(t *testing.T) {
 			subject := newParticipantTestSubject(t, seed, 0)
 			subject.requireStart()
 			require.NotPanics(t, func() {
-				gotErr := subject.ReceiveMessage(nil)
+				gotErr := subject.ReceiveMessage(ctx, nil)
 				require.Error(t, gotErr)
 			})
 		})
@@ -266,25 +268,32 @@ func TestParticipant(t *testing.T) {
 			initialInstance := uint64(0)
 			subject := newParticipantTestSubject(t, seed, initialInstance)
 			subject.mockCommitteeForInstance(initialInstance, subject.powerTable, subject.beacon)
-			gotValidated, gotValidateErr := subject.ValidateMessage(&gpbft.GMessage{
+			msg := &gpbft.GMessage{
 				Sender: subject.id,
 				Vote: gpbft.Payload{
 					SupplementalData: *subject.supplementalData,
 				},
-			})
+			}
+			gotValidated, gotValidateErr := subject.ValidateMessage(ctx, msg)
 			require.Nil(t, gotValidated)
+			require.ErrorContains(t, gotValidateErr, "invalid vote phase: 0")
+
+			gotPartiallyValidated, gotValidateErr := subject.PartiallyValidateMessage(ctx, &gpbft.PartialGMessage{
+				GMessage: msg,
+			})
+			require.Nil(t, gotPartiallyValidated)
 			require.ErrorContains(t, gotValidateErr, "invalid vote phase: 0")
 		})
 		t.Run("message is accepted (queued)", func(t *testing.T) {
 			subject := newParticipantTestSubject(t, seed, 0)
-			gotReceiveErr := subject.ReceiveMessage(Validated(new(gpbft.GMessage)))
+			gotReceiveErr := subject.ReceiveMessage(ctx, Validated(new(gpbft.GMessage)))
 			require.NoError(t, gotReceiveErr)
 		})
 		t.Run("instance is begun", func(t *testing.T) {
 			t.Run("on ReceiveAlarm", func(t *testing.T) {
 				subject := newParticipantTestSubject(t, seed, 0)
 				subject.expectBeginInstance()
-				require.NoError(t, subject.ReceiveAlarm())
+				require.NoError(t, subject.ReceiveAlarm(ctx))
 				subject.assertHostExpectations()
 				subject.requireInstanceRoundPhase(0, 0, gpbft.QUALITY_PHASE)
 			})
@@ -308,7 +317,7 @@ func TestParticipant(t *testing.T) {
 				require.NoError(t, subject.StartInstanceAt(fInstance, subject.time))
 				// set subject to the finality instance to see if participant
 				// has begun the right instance.
-				require.NoError(t, subject.ReceiveAlarm())
+				require.NoError(t, subject.ReceiveAlarm(ctx))
 				subject.assertHostExpectations()
 				subject.requireInstanceRoundPhase(57, 0, gpbft.QUALITY_PHASE)
 			})
@@ -318,7 +327,7 @@ func TestParticipant(t *testing.T) {
 				subject := newParticipantTestSubject(t, seed, 0)
 				var zeroChain gpbft.ECChain
 				emptySupplementalData := new(gpbft.SupplementalData)
-				subject.host.On("GetProposal", subject.instance).Return(emptySupplementalData, &zeroChain, nil)
+				subject.host.On("GetProposal", mock.Anything, subject.instance).Return(emptySupplementalData, &zeroChain, nil)
 				require.ErrorContains(t, subject.Start(), "cannot be zero-valued")
 				subject.assertHostExpectations()
 				subject.requireNotStarted()
@@ -327,7 +336,7 @@ func TestParticipant(t *testing.T) {
 				subject := newParticipantTestSubject(t, seed, 0)
 				invalidChain := &gpbft.ECChain{TipSets: []*gpbft.TipSet{{PowerTable: subject.supplementalData.PowerTable}}}
 				emptySupplementalData := new(gpbft.SupplementalData)
-				subject.host.On("GetProposal", subject.instance).Return(emptySupplementalData, invalidChain, nil)
+				subject.host.On("GetProposal", mock.Anything, subject.instance).Return(emptySupplementalData, invalidChain, nil)
 				require.ErrorContains(t, subject.Start(), "invalid canonical chain")
 				subject.assertHostExpectations()
 				subject.requireNotStarted()
@@ -336,7 +345,7 @@ func TestParticipant(t *testing.T) {
 				subject := newParticipantTestSubject(t, seed, 0)
 				invalidChain := &gpbft.ECChain{TipSets: []*gpbft.TipSet{{PowerTable: subject.supplementalData.PowerTable}}}
 				emptySupplementalData := new(gpbft.SupplementalData)
-				subject.host.On("GetProposal", subject.instance).Return(emptySupplementalData, invalidChain, errors.New("fish"))
+				subject.host.On("GetProposal", mock.Anything, subject.instance).Return(emptySupplementalData, invalidChain, errors.New("fish"))
 				require.ErrorContains(t, subject.Start(), "fish")
 				subject.assertHostExpectations()
 				subject.requireNotStarted()
@@ -352,8 +361,8 @@ func TestParticipant(t *testing.T) {
 				supplementalData := &gpbft.SupplementalData{
 					PowerTable: chain.TipSets[0].PowerTable,
 				}
-				subject.host.On("GetProposal", subject.instance).Return(supplementalData, chain, nil)
-				subject.host.On("GetCommittee", subject.instance).Return(nil, errors.New("fish"))
+				subject.host.On("GetProposal", mock.Anything, subject.instance).Return(supplementalData, chain, nil)
+				subject.host.On("GetCommittee", mock.Anything, subject.instance).Return(nil, errors.New("fish"))
 				require.ErrorContains(t, subject.Start(), "fish")
 				subject.assertHostExpectations()
 				subject.requireNotStarted()
@@ -456,7 +465,7 @@ func TestParticipant(t *testing.T) {
 				t.Run(test.name, func(t *testing.T) {
 					subject := newParticipantTestSubject(t, seed, initialInstance)
 					subject.requireStart()
-					gotErr := subject.ReceiveMessage(Validated(test.message(subject)))
+					gotErr := subject.ReceiveMessage(ctx, Validated(test.message(subject)))
 					if test.wantErr == "" {
 						require.NoError(t, gotErr)
 					} else {
@@ -983,7 +992,7 @@ func TestParticipant_ValidateMessage(t *testing.T) {
 			wantErr: "has justification from wrong round",
 		},
 		{
-			name: "justification with invalid value is error",
+			name: "justification with different value is error",
 			msg: func(subject *participantTestSubject) *gpbft.GMessage {
 				subject.mockValidSignature(somePowerEntry.PubKey, signature)
 				return &gpbft.GMessage{
@@ -998,13 +1007,14 @@ func TestParticipant_ValidateMessage(t *testing.T) {
 					Justification: &gpbft.Justification{
 						Vote: gpbft.Payload{
 							Instance:         initialInstanceNumber,
+							Phase:            gpbft.PREPARE_PHASE,
 							Value:            &gpbft.ECChain{TipSets: []*gpbft.TipSet{subject.canonicalChain.Base(), {PowerTable: subject.supplementalData.PowerTable}}},
 							SupplementalData: *subject.supplementalData,
 						},
 					},
 				}
 			},
-			wantErr: "invalid justification vote value chain",
+			wantErr: "has invalid justification vote value chain",
 		},
 	}
 	for _, test := range tests {
@@ -1028,12 +1038,40 @@ func TestParticipant_ValidateMessage(t *testing.T) {
 			}
 			testValidate := func(msg *gpbft.GMessage) {
 				testRoundTrip(msg)
-				gotValidated, gotValidateErr := subject.ValidateMessage(msg)
+				gotValidated, gotValidateErr := subject.ValidateMessage(context.Background(), msg)
 				subject.assertHostExpectations()
 				if test.wantErr != "" {
 					require.ErrorContains(t, gotValidateErr, test.wantErr)
 				} else {
 					require.NoError(t, gotValidateErr)
+				}
+				require.Equal(t, gotValidated != nil, gotValidateErr == nil)
+			}
+			testPartialValidate := func(msg *gpbft.GMessage) {
+				testRoundTrip(msg)
+
+				msgCopy := *msg
+				msgCopy.Vote.Value = nil
+				if msgCopy.Justification != nil {
+					msgCopy.Justification.Vote.Value = nil
+				}
+
+				gotValidated, gotValidateErr := subject.PartiallyValidateMessage(context.Background(), &gpbft.PartialGMessage{
+					GMessage:     &msgCopy,
+					VoteValueKey: msg.Vote.Value.Key(),
+				})
+				subject.assertHostExpectations()
+				if test.wantErr != "" {
+					require.ErrorContains(t, gotValidateErr, test.wantErr)
+				} else {
+					require.NoError(t, gotValidateErr)
+					gotValidated.PartialMessage().Vote.Value = msg.Vote.Value
+					if msg.Justification != nil {
+						gotValidated.PartialMessage().Justification.Vote.Value = msg.Justification.Vote.Value
+					}
+					gotFullyValidated, gotValidateErr := subject.FullyValidateMessage(context.Background(), gotValidated)
+					require.NoError(t, gotValidateErr)
+					require.NotNil(t, gotFullyValidated)
 				}
 				require.Equal(t, gotValidated != nil, gotValidateErr == nil)
 			}
@@ -1044,6 +1082,7 @@ func TestParticipant_ValidateMessage(t *testing.T) {
 			if test.msgs != nil {
 				for _, msg := range test.msgs(subject) {
 					testValidate(msg)
+					testPartialValidate(msg)
 				}
 			}
 		})
@@ -1084,18 +1123,50 @@ func TestParticipant_ValidateMessageParallel(t *testing.T) {
 			Signature: signature,
 		}
 
-		gotValidated, gotValidateErr := subject.ValidateMessage(msg)
+		gotValidated, gotValidateErr := subject.ValidateMessage(context.Background(), msg)
 		require.NoError(t, gotValidateErr)
-		require.Equal(t, gotValidated != nil, gotValidateErr == nil)
+		require.NotNil(t, gotValidated)
+	}
+	partiallyValidateOne := func(i uint64) {
+		msg := &gpbft.GMessage{
+			Sender: somePowerEntry.ID,
+			Vote: gpbft.Payload{
+				Instance: initialInstanceNumber + (i % instanceCount),
+				Phase:    gpbft.QUALITY_PHASE,
+				SupplementalData: gpbft.SupplementalData{
+					PowerTable: ptCid,
+				},
+			},
+			Signature: signature,
+		}
+
+		gotValidated, gotValidateErr := subject.PartiallyValidateMessage(context.Background(), &gpbft.PartialGMessage{
+			GMessage:     msg,
+			VoteValueKey: subject.canonicalChain.Key(),
+		})
+		require.NoError(t, gotValidateErr)
+		require.NotNil(t, gotValidated)
+
+		gotValidated.PartialMessage().Vote.Value = subject.canonicalChain
+
+		gotFullyValidated, gotValidateErr := subject.FullyValidateMessage(context.Background(), gotValidated)
+		require.NoError(t, gotValidateErr)
+		require.NotNil(t, gotFullyValidated)
 	}
 	// Run validation in parallel.
 	var wg sync.WaitGroup
-	wg.Add(concurrency)
+	wg.Add(concurrency * 2)
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < msgCount; j++ {
 				validateOne(uint64(j))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < msgCount; j++ {
+				partiallyValidateOne(uint64(j))
 			}
 		}()
 	}

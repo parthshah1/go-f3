@@ -1,9 +1,13 @@
+// certchain package is a testing utility for generating and validating
+// finality certificates.
+// It has no effect on the consensus protocol.
 package certchain
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"slices"
 
@@ -45,17 +49,18 @@ func New(o ...Option) (*CertChain, error) {
 	}, nil
 }
 
-func (cc *CertChain) GetCommittee(instance uint64) (*gpbft.Committee, error) {
+func (cc *CertChain) GetCommittee(ctx context.Context, instance uint64) (*gpbft.Committee, error) {
 	var committeeEpoch int64
 	if instance < cc.m.InitialInstance+cc.m.CommitteeLookback {
 		committeeEpoch = cc.m.BootstrapEpoch - cc.m.EC.Finality
 	} else {
-		lookbackIndex := instance - cc.m.CommitteeLookback + 1
+		lookbackIndex := instance - cc.m.CommitteeLookback - cc.m.InitialInstance + 1
+		if lookbackIndex >= uint64(len(cc.certificates)) {
+			return nil, fmt.Errorf("no prior finality certificate to get committee at instance %d", instance)
+		}
 		certAtLookback := cc.certificates[lookbackIndex]
 		committeeEpoch = certAtLookback.ECChain.Head().Epoch
 	}
-	//TODO refactor CommitteeProvider in gpbft to take context.
-	ctx := context.TODO()
 	tspt, err := cc.getTipSetWithPowerTableByEpoch(ctx, committeeEpoch)
 	if err != nil {
 		return nil, err
@@ -63,22 +68,20 @@ func (cc *CertChain) GetCommittee(instance uint64) (*gpbft.Committee, error) {
 	return cc.getCommittee(tspt)
 }
 
-func (cc *CertChain) GetProposal(instance uint64) (*gpbft.SupplementalData, *gpbft.ECChain, error) {
-	//TODO refactor ProposalProvider in gpbft to take context.
-	ctx := context.TODO()
+func (cc *CertChain) GetProposal(ctx context.Context, instance uint64) (*gpbft.SupplementalData, *gpbft.ECChain, error) {
 	proposal, err := cc.generateProposal(ctx, instance)
 	if err != nil {
 		return nil, nil, err
 	}
-	suppData, err := cc.getSupplementalData(instance)
+	suppData, err := cc.getSupplementalData(ctx, instance)
 	if err != nil {
 		return nil, nil, err
 	}
 	return suppData, proposal, nil
 }
 
-func (cc *CertChain) getSupplementalData(instance uint64) (*gpbft.SupplementalData, error) {
-	nextCommittee, err := cc.GetCommittee(instance + 1)
+func (cc *CertChain) getSupplementalData(ctx context.Context, instance uint64) (*gpbft.SupplementalData, error) {
+	nextCommittee, err := cc.GetCommittee(ctx, instance+1)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +160,7 @@ func (cc *CertChain) signProportionally(ctx context.Context, committee *gpbft.Co
 	// range of 66% to 100% of total power.
 	const minimumPower = 2.0 / 3.0
 	targetPowerPortion := minimumPower + cc.rng.Float64()*(1.0-minimumPower)
-	signingPowerThreshold := int64(float64(committee.PowerTable.ScaledTotal) * targetPowerPortion)
+	signingPowerThreshold := int64(math.Ceil(float64(committee.PowerTable.ScaledTotal) * targetPowerPortion))
 
 	var signingPowerSoFar int64
 	type signatureAt struct {
@@ -165,7 +168,7 @@ func (cc *CertChain) signProportionally(ctx context.Context, committee *gpbft.Co
 		signature   []byte
 	}
 	var signatures []signatureAt
-	marshalledPayload := cc.sv.MarshalPayloadForSigning(cc.m.NetworkName, payload)
+	marshalledPayload := payload.MarshalForSigning(cc.m.NetworkName)
 	for _, p := range candidateSigners {
 		scaledPower, key := committee.PowerTable.Get(p.ID)
 		if scaledPower == 0 {
@@ -215,12 +218,12 @@ func (cc *CertChain) signProportionally(ctx context.Context, committee *gpbft.Co
 
 func (cc *CertChain) sign(ctx context.Context, committee *gpbft.Committee, payload *gpbft.Payload, signers *bitfield.BitField) ([]byte, error) {
 	const minimumPower = 2.0 / 3.0
-	minSigningPower := int64(float64(committee.PowerTable.ScaledTotal) * minimumPower)
+	minSigningPower := int64(math.Ceil(float64(committee.PowerTable.ScaledTotal) * minimumPower))
 
 	var signingPowerSoFar int64
 	var signatures [][]byte
 	var signersMask []int
-	marshalledPayload := cc.sv.MarshalPayloadForSigning(cc.m.NetworkName, payload)
+	marshalledPayload := payload.MarshalForSigning(cc.m.NetworkName)
 	if err := signers.ForEach(
 		func(signerIndex uint64) error {
 			p := committee.PowerTable.Entries[signerIndex]
@@ -270,13 +273,13 @@ func (cc *CertChain) Generate(ctx context.Context, length uint64) ([]*certs.Fina
 	}
 
 	instance := cc.m.InitialInstance
-	committee, err := cc.GetCommittee(instance)
+	committee, err := cc.GetCommittee(ctx, instance)
 	if err != nil {
 		return nil, err
 	}
 	var nextCommittee *gpbft.Committee
 	for range length {
-		suppData, proposal, err := cc.GetProposal(instance)
+		suppData, proposal, err := cc.GetProposal(ctx, instance)
 		if err != nil {
 			return nil, err
 		}
@@ -291,7 +294,7 @@ func (cc *CertChain) Generate(ctx context.Context, length uint64) ([]*certs.Fina
 			return nil, err
 		}
 
-		nextCommittee, err = cc.GetCommittee(instance + 1)
+		nextCommittee, err = cc.GetCommittee(ctx, instance+1)
 		if err != nil {
 			return nil, err
 		}
@@ -314,14 +317,14 @@ func (cc *CertChain) Validate(ctx context.Context, crts []*certs.FinalityCertifi
 	for _, cert := range crts {
 		instance := cert.GPBFTInstance
 		proposal := cert.ECChain
-		suppData, err := cc.getSupplementalData(instance)
+		suppData, err := cc.getSupplementalData(ctx, instance)
 		if err != nil {
 			return err
 		}
 		if !suppData.Eq(&cert.SupplementalData) {
 			return fmt.Errorf("supplemental data mismatch at instance %d", instance)
 		}
-		committee, err := cc.GetCommittee(instance)
+		committee, err := cc.GetCommittee(ctx, instance)
 		if err != nil {
 			return fmt.Errorf("getting committee for instance %d: %w", instance, err)
 		}

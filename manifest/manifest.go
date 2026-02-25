@@ -1,13 +1,11 @@
 package manifest
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"time"
 
 	"github.com/filecoin-project/go-f3/gpbft"
@@ -19,7 +17,7 @@ import (
 // ErrNoManifest is returned when no manifest is known.
 var ErrNoManifest = errors.New("no known manifest")
 
-const VersionCapability = 5
+const VersionCapability = 7
 
 var (
 	DefaultCommitteeLookback uint64 = 10
@@ -55,7 +53,10 @@ var (
 	}
 
 	DefaultPubSubConfig = PubSubConfig{
-		CompressionEnabled: false,
+		CompressionEnabled:             true,
+		ChainCompressionEnabled:        true,
+		GMessageSubscriptionBufferSize: 128,
+		ValidatedMessageBufferSize:     128,
 	}
 
 	DefaultChainExchangeConfig = ChainExchangeConfig{
@@ -68,18 +69,19 @@ var (
 		MaxTimestampAge:                8 * time.Second,
 	}
 
+	DefaultPartialMessageManagerConfig = PartialMessageManagerConfig{
+		PendingDiscoveredChainsBufferSize:     100,
+		PendingPartialMessagesBufferSize:      100,
+		PendingChainBroadcastsBufferSize:      100,
+		PendingInstanceRemovalBufferSize:      10, // to match the default committee lookback.
+		CompletedMessagesBufferSize:           100,
+		MaxBufferedMessagesPerInstance:        25_000, // Based on 5 phases, network size of 2K participants at a couple of rounds plus some headroom.
+		MaxCachedValidatedMessagesPerInstance: 25_000, // Based on 5 phases, network size of 2K participants at a couple of rounds plus some headroom.
+	}
+
 	// Default instance alignment when catching up.
 	DefaultCatchUpAlignment = DefaultEcConfig.Period / 2
 )
-
-type ManifestProvider interface {
-	// Start any background tasks required for the operation of the manifest provider.
-	Start(context.Context) error
-	// Stop stops a running manifest provider.
-	Stop(context.Context) error
-	// The channel on which manifest updates are returned.
-	ManifestUpdates() <-chan *Manifest
-}
 
 // Certificate Exchange config
 type CxConfig struct {
@@ -186,14 +188,6 @@ type EcConfig struct {
 	Finalize bool
 }
 
-func (e *EcConfig) Equal(o *EcConfig) bool {
-	return e.Period == o.Period &&
-		e.Finality == o.Finality &&
-		e.DelayMultiplier == o.DelayMultiplier &&
-		e.HeadLookback == o.HeadLookback &&
-		slices.Equal(e.BaseDecisionBackoffTable, o.BaseDecisionBackoffTable)
-}
-
 func (e *EcConfig) Validate() error {
 	switch {
 	case e.HeadLookback < 0:
@@ -217,10 +211,23 @@ func (e *EcConfig) Validate() error {
 }
 
 type PubSubConfig struct {
-	CompressionEnabled bool
+	CompressionEnabled      bool
+	ChainCompressionEnabled bool
+
+	GMessageSubscriptionBufferSize int
+	ValidatedMessageBufferSize     int
 }
 
-func (p *PubSubConfig) Validate() error { return nil }
+func (p *PubSubConfig) Validate() error {
+	switch {
+	case p.GMessageSubscriptionBufferSize < 1:
+		return fmt.Errorf("pubsub gmessage subscription buffer size must be at least 1, got: %d", p.GMessageSubscriptionBufferSize)
+	case p.ValidatedMessageBufferSize < 1:
+		return fmt.Errorf("pubsub validated gmessage buffer size must be at least 1, got: %d", p.ValidatedMessageBufferSize)
+	default:
+		return nil
+	}
+}
 
 type ChainExchangeConfig struct {
 	SubscriptionBufferSize         int
@@ -244,8 +251,43 @@ func (cx *ChainExchangeConfig) Validate() error {
 		return fmt.Errorf("chain exchange max discovered chains per instance must be at least 1, got: %d", cx.MaxDiscoveredChainsPerInstance)
 	case cx.MaxWantedChainsPerInstance < 1:
 		return fmt.Errorf("chain exchange max wanted chains per instance must be at least 1, got: %d", cx.MaxWantedChainsPerInstance)
-	case cx.RebroadcastInterval < 1*time.Millisecond: // 1 ms is a made-up minimum to avoid accidental hot-loop of chain rebroadcast.
+	case cx.RebroadcastInterval < 1*time.Millisecond:
+		// The timestamp precision is set to milliseconds. Therefore, the rebroadcast interval must not be less than a millisecond.
 		return fmt.Errorf("chain exchange rebroadcast interval cannot be less than 1ms, got: %s", cx.RebroadcastInterval)
+	case cx.MaxTimestampAge < 1*time.Millisecond:
+		// The 1 ms is arbitrarily chosen as a reasonable non-zero minimum.
+		return fmt.Errorf("chain exchange max timestamp age must not  be less than 1ms, got: %s", cx.MaxTimestampAge)
+	default:
+		return nil
+	}
+}
+
+type PartialMessageManagerConfig struct {
+	PendingDiscoveredChainsBufferSize     int
+	PendingPartialMessagesBufferSize      int
+	PendingChainBroadcastsBufferSize      int
+	PendingInstanceRemovalBufferSize      int
+	CompletedMessagesBufferSize           int
+	MaxBufferedMessagesPerInstance        int
+	MaxCachedValidatedMessagesPerInstance int
+}
+
+func (pmm *PartialMessageManagerConfig) Validate() error {
+	switch {
+	case pmm.PendingDiscoveredChainsBufferSize < 1:
+		return fmt.Errorf("pending discovered chains buffer size must be at least 1, got: %d", pmm.PendingDiscoveredChainsBufferSize)
+	case pmm.PendingPartialMessagesBufferSize < 1:
+		return fmt.Errorf("pending partial messages buffer size must be at least 1, got: %d", pmm.PendingPartialMessagesBufferSize)
+	case pmm.PendingChainBroadcastsBufferSize < 1:
+		return fmt.Errorf("pending chain broadcasts buffer size must be at least 1, got: %d", pmm.PendingChainBroadcastsBufferSize)
+	case pmm.PendingInstanceRemovalBufferSize < 1:
+		return fmt.Errorf("pending instance removal buffer size must be at least 1, got: %d", pmm.PendingInstanceRemovalBufferSize)
+	case pmm.CompletedMessagesBufferSize < 1:
+		return fmt.Errorf("completed messages buffer size must be at least 1, got: %d", pmm.CompletedMessagesBufferSize)
+	case pmm.MaxBufferedMessagesPerInstance < 1:
+		return fmt.Errorf("max buffered messages per instance must be at least 1, got: %d", pmm.MaxBufferedMessagesPerInstance)
+	case pmm.MaxCachedValidatedMessagesPerInstance < 1:
+		return fmt.Errorf("max cached validated messages per instance must be at least 1, got: %d", pmm.MaxCachedValidatedMessagesPerInstance)
 	default:
 		return nil
 	}
@@ -253,8 +295,6 @@ func (cx *ChainExchangeConfig) Validate() error {
 
 // Manifest identifies the specific configuration for the F3 instance currently running.
 type Manifest struct {
-	// Pause stops the participation in F3.
-	Pause bool
 	// ProtocolVersion specifies protocol version to be used
 	ProtocolVersion uint64
 	// Initial instance to used for the f3 instance
@@ -263,11 +303,6 @@ type Manifest struct {
 	BootstrapEpoch int64
 	// Network name to apply for this manifest.
 	NetworkName gpbft.NetworkName
-	// Updates to perform over the power table from EC (by replacement). Any entries with 0
-	// power will disable the participant.
-	ExplicitPower gpbft.PowerEntries
-	// Ignore the power table from EC.
-	IgnoreECPower bool
 	// InitialPowerTable specifies the optional CID of the initial power table
 	InitialPowerTable cid.Cid // !Defined() if nil
 	// We take the current power table from the head tipset this many instances ago.
@@ -288,29 +323,8 @@ type Manifest struct {
 	PubSub PubSubConfig
 	// ChainExchange specifies the chain exchange configuration parameters.
 	ChainExchange ChainExchangeConfig
-}
-
-func (m *Manifest) Equal(o *Manifest) bool {
-	if m == nil || o == nil {
-		return m == o
-	}
-
-	return m.NetworkName == o.NetworkName &&
-		m.Pause == o.Pause &&
-		m.InitialInstance == o.InitialInstance &&
-		m.BootstrapEpoch == o.BootstrapEpoch &&
-		m.IgnoreECPower == o.IgnoreECPower &&
-		m.CommitteeLookback == o.CommitteeLookback &&
-		// Don't include this in equality checks because it doesn't change the meaning of
-		// the manifest (and we don't want to restart the network when we first publish
-		// this).
-		// m.InitialPowerTable.Equals(o.InitialPowerTable) &&
-		m.ExplicitPower.Equal(o.ExplicitPower) &&
-		m.Gpbft == o.Gpbft &&
-		m.EC.Equal(&o.EC) &&
-		m.CertificateExchange == o.CertificateExchange &&
-		m.ProtocolVersion == o.ProtocolVersion
-
+	// PartialMessageManager specifies the configuration for the partial message manager.
+	PartialMessageManager PartialMessageManagerConfig
 }
 
 func (m *Manifest) Validate() error {
@@ -322,23 +336,6 @@ func (m *Manifest) Validate() error {
 	case m.BootstrapEpoch < m.EC.Finality:
 		return fmt.Errorf("invalid manifest: bootstrap epoch %d before finality %d",
 			m.BootstrapEpoch, m.EC.Finality)
-	case m.IgnoreECPower && len(m.ExplicitPower) == 0:
-		return fmt.Errorf("invalid manifest: ignoring ec power with no explicit power")
-	}
-
-	if len(m.ExplicitPower) > 0 {
-		pt := gpbft.NewPowerTable()
-		if err := pt.Add(m.ExplicitPower...); err != nil {
-			return fmt.Errorf("invalid manifest: invalid power entries")
-		}
-
-		if err := pt.Validate(); err != nil {
-			return fmt.Errorf("invalid manifest: %w", err)
-		}
-
-		if m.IgnoreECPower && pt.Total.Sign() <= 0 {
-			return fmt.Errorf("invalid manifest: no power")
-		}
 	}
 
 	if err := m.Gpbft.Validate(); err != nil {
@@ -356,8 +353,11 @@ func (m *Manifest) Validate() error {
 	if err := m.ChainExchange.Validate(); err != nil {
 		return fmt.Errorf("invalid manifest: invalid chain exchange config: %w", err)
 	}
-	if m.ChainExchange.MaxChainLength > m.Gpbft.ChainProposedLength {
-		return fmt.Errorf("invalid manifest: chain exchange max chain length %d exceeds gpbft proposed chain length %d", m.ChainExchange.MaxChainLength, m.Gpbft.ChainProposedLength)
+	if err := m.PartialMessageManager.Validate(); err != nil {
+		return fmt.Errorf("invalid manifest: invalid partial message manager config: %w", err)
+	}
+	if m.Gpbft.ChainProposedLength > m.ChainExchange.MaxChainLength {
+		return fmt.Errorf("invalid manifest: chain proposal length %d is greater than chain exchange max chain length %d", m.Gpbft.ChainProposedLength, m.ChainExchange.MaxChainLength)
 	}
 	if m.ChainExchange.MaxInstanceLookahead > m.CommitteeLookback {
 		return fmt.Errorf("invalid manifest: chain exchange max instance lookahead %d exceeds committee lookback %d", m.ChainExchange.MaxInstanceLookahead, m.CommitteeLookback)
@@ -366,22 +366,22 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
-func LocalDevnetManifest() *Manifest {
+func LocalDevnetManifest() Manifest {
 	rng := make([]byte, 4)
 	_, _ = rand.Read(rng)
-	m := &Manifest{
-		ProtocolVersion:     VersionCapability,
-		NetworkName:         gpbft.NetworkName(fmt.Sprintf("localnet-%X", rng)),
-		BootstrapEpoch:      1000,
-		CommitteeLookback:   DefaultCommitteeLookback,
-		EC:                  DefaultEcConfig,
-		Gpbft:               DefaultGpbftConfig,
-		CertificateExchange: DefaultCxConfig,
-		CatchUpAlignment:    DefaultCatchUpAlignment,
-		PubSub:              DefaultPubSubConfig,
-		ChainExchange:       DefaultChainExchangeConfig,
+	return Manifest{
+		ProtocolVersion:       VersionCapability,
+		NetworkName:           gpbft.NetworkName(fmt.Sprintf("localnet-%X", rng)),
+		BootstrapEpoch:        1000,
+		CommitteeLookback:     DefaultCommitteeLookback,
+		EC:                    DefaultEcConfig,
+		Gpbft:                 DefaultGpbftConfig,
+		CertificateExchange:   DefaultCxConfig,
+		CatchUpAlignment:      DefaultCatchUpAlignment,
+		PubSub:                DefaultPubSubConfig,
+		ChainExchange:         DefaultChainExchangeConfig,
+		PartialMessageManager: DefaultPartialMessageManagerConfig,
 	}
-	return m
 }
 
 // Marshal the manifest into JSON
@@ -427,7 +427,7 @@ func (m *Manifest) Cid() (cid.Cid, error) {
 }
 
 func PubSubTopicFromNetworkName(nn gpbft.NetworkName) string {
-	return "/f3/granite/0.0.2/" + string(nn)
+	return "/f3/granite/0.0.3/" + string(nn)
 }
 
 func ChainExchangeTopicFromNetworkName(nn gpbft.NetworkName) string {

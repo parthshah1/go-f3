@@ -12,15 +12,18 @@ import (
 
 var _ Receiver = (*WithholdCommit)(nil)
 
-// This adversary send its COMMIT message to only a single victim, withholding it from others.
-// Against a naive algorithm, when set up with 30% of power, and a victim set with 40%,
-// it can cause one victim to decide, while others revert to the base.
+// WithholdCommit adversary sends its COMMIT message to only a single victim,
+// withholding it from others. Against a naive algorithm, when set up with 30% of
+// power, and a victim set with 40%, it can cause one victim to decide, while
+// others revert to the base.
 type WithholdCommit struct {
 	id   gpbft.ActorID
 	host Host
 	// The first victim is the target, others are those who need to confirm.
 	victims     []gpbft.ActorID
 	victimValue *gpbft.ECChain
+
+	Absent
 }
 
 // A participant that never sends anything.
@@ -38,6 +41,7 @@ func NewWitholdCommitGenerator(power gpbft.StoragePower, victims []gpbft.ActorID
 		return &Adversary{
 			Receiver: wc,
 			Power:    power,
+			ID:       id,
 		}
 	}
 }
@@ -47,19 +51,17 @@ func (w *WithholdCommit) SetVictim(victims []gpbft.ActorID, victimValue *gpbft.E
 	w.victimValue = victimValue
 }
 
-func (w *WithholdCommit) ID() gpbft.ActorID {
-	return w.id
-}
+func (w *WithholdCommit) StartInstanceAt(instance uint64, _ time.Time) error {
 
-func (w *WithholdCommit) StartInstanceAt(instance uint64, _when time.Time) error {
 	if len(w.victims) == 0 {
 		return errors.New("victims must be set")
 	}
-	supplementalData, _, err := w.host.GetProposal(instance)
+	ctx := context.Background()
+	supplementalData, _, err := w.host.GetProposal(ctx, instance)
 	if err != nil {
 		panic(err)
 	}
-	committee, err := w.host.GetCommittee(instance)
+	committee, err := w.host.GetCommittee(ctx, instance)
 	if err != nil {
 		panic(err)
 	}
@@ -107,7 +109,7 @@ func (w *WithholdCommit) StartInstanceAt(instance uint64, _when time.Time) error
 
 	signatures := make([][]byte, 0)
 	mask := make([]int, 0)
-	prepareMarshalled := w.host.MarshalPayloadForSigning(w.host.NetworkName(), &preparePayload)
+	prepareMarshalled := preparePayload.MarshalForSigning(w.host.NetworkName())
 	for _, signerIndex := range signers {
 		entry := committee.PowerTable.Entries[signerIndex]
 		signatures = append(signatures, w.sign(entry.PubKey, prepareMarshalled))
@@ -124,18 +126,6 @@ func (w *WithholdCommit) StartInstanceAt(instance uint64, _when time.Time) error
 	}
 
 	broadcast(commitPayload, &justification)
-	return nil
-}
-
-func (*WithholdCommit) ValidateMessage(msg *gpbft.GMessage) (gpbft.ValidatedMessage, error) {
-	return Validated(msg), nil
-}
-
-func (*WithholdCommit) ReceiveMessage(gpbft.ValidatedMessage) error {
-	return nil
-}
-
-func (*WithholdCommit) ReceiveAlarm() error {
 	return nil
 }
 
@@ -181,11 +171,10 @@ func (w *WithholdCommit) sign(pubkey gpbft.PubKey, msg []byte) []byte {
 func (w *WithholdCommit) synchronousBroadcastRequester(powertable *gpbft.PowerTable) func(gpbft.Payload, *gpbft.Justification) {
 	return func(payload gpbft.Payload, justification *gpbft.Justification) {
 		mb := &gpbft.MessageBuilder{
-			NetworkName:      w.host.NetworkName(),
-			PowerTable:       powertable,
-			Payload:          payload,
-			Justification:    justification,
-			SigningMarshaler: w.host,
+			NetworkName:   w.host.NetworkName(),
+			PowerTable:    powertable,
+			Payload:       payload,
+			Justification: justification,
 		}
 		if err := w.host.RequestSynchronousBroadcast(mb); err != nil {
 			panic(err)

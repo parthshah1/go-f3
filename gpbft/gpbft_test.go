@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/filecoin-project/go-f3/emulator"
 	"github.com/filecoin-project/go-f3/gpbft"
@@ -224,7 +225,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 			Vote:   instance.NewCommit(0, &gpbft.ECChain{}),
 		})
 
-		evidenceOfCommitForBottom := instance.NewJustification(0, gpbft.COMMIT_PHASE, &gpbft.ECChain{}, 0, 1)
+		evidenceOfCommitForBottom := instance.NewJustification(0, gpbft.COMMIT_PHASE, nil, 0, 1)
 
 		driver.RequireConverge(1, baseChain, evidenceOfCommitForBottom)
 		driver.RequireDeliverMessage(&gpbft.GMessage{
@@ -341,7 +342,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 		driver.RequireStartInstance(futureInstance.ID())
 		driver.RequireQuality()
 		driver.RequirePrepare(futureInstance.Proposal())
-		driver.RequireCommit(0, futureInstance.Proposal(), instance.NewJustification(0, gpbft.PREPARE_PHASE, futureInstance.Proposal(), 0, 1))
+		driver.RequireCommit(0, futureInstance.Proposal(), futureInstance.NewJustification(0, gpbft.PREPARE_PHASE, futureInstance.Proposal(), 0, 1))
 	})
 
 	t.Run("Rebroadcasts selected messages on timeout", func(t *testing.T) {
@@ -378,7 +379,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 		})
 
 		// Expect progress to COMMIT with strong evidence of PREPARE.
-		evidenceOfPrepare := instance.NewJustification(0, gpbft.PREPARE_PHASE, instance.Proposal(), 0, 1)
+		evidenceOfPrepare := instance.NewJustification(0, gpbft.PREPARE_PHASE, baseChain, 0, 1)
 		driver.RequireCommit(0, baseChain, evidenceOfPrepare)
 
 		// Expect no messages until the rebroadcast timeout has expired.
@@ -462,6 +463,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 
 		futureRoundProposal := instance.Proposal().Extend(tipSet4.Key)
 		evidenceOfPrepareAtRound76 := instance.NewJustification(76, gpbft.PREPARE_PHASE, futureRoundProposal, 0, 1)
+		evidenceOfPrepareAtRound77 := instance.NewJustification(77, gpbft.PREPARE_PHASE, futureRoundProposal, 0, 1)
 
 		// Send Prepare messages to facilitate weak quorum of prepare at future round.
 		driver.RequireDeliverMessage(&gpbft.GMessage{
@@ -479,7 +481,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 		// Expect skip to round.
 		driver.RequireConverge(77, futureRoundProposal, evidenceOfPrepareAtRound76)
 		driver.RequirePrepareAtRound(77, futureRoundProposal, evidenceOfPrepareAtRound76)
-		driver.RequireCommit(77, futureRoundProposal, evidenceOfPrepareAtRound76)
+		driver.RequireCommit(77, futureRoundProposal, evidenceOfPrepareAtRound77)
 		// Expect no messages until the rebroadcast timeout has expired.
 		driver.RequireNoBroadcast()
 		// Trigger rebroadcast alarm.
@@ -491,7 +493,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 		//
 		// See: https://github.com/filecoin-project/go-f3/issues/595
 		driver.RequireQuality()
-		driver.RequireCommit(77, futureRoundProposal, evidenceOfPrepareAtRound76)
+		driver.RequireCommit(77, futureRoundProposal, evidenceOfPrepareAtRound77)
 		driver.RequirePrepareAtRound(77, futureRoundProposal, evidenceOfPrepareAtRound76)
 		driver.RequireConverge(77, futureRoundProposal, evidenceOfPrepareAtRound76)
 		driver.RequireNoBroadcast()
@@ -500,7 +502,7 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 		driver.RequireDeliverMessage(&gpbft.GMessage{
 			Sender:        1,
 			Vote:          instance.NewCommit(77, futureRoundProposal),
-			Justification: evidenceOfPrepareAtRound76,
+			Justification: evidenceOfPrepareAtRound77,
 		})
 
 		// Expect DECIDE with strong evidence of COMMIT.
@@ -521,6 +523,168 @@ func TestGPBFT_WithEvenPowerDistribution(t *testing.T) {
 			Justification: evidenceOfCommit,
 		})
 		driver.RequireDecision(instance.ID(), futureRoundProposal)
+	})
+
+	t.Run("Rebroadcasts independent of phase timeout after 3 rounds", func(t *testing.T) {
+		instance, driver := newInstanceAndDriver(t)
+		driver.RequireStartInstance(instance.ID())
+		driver.RequireQuality()
+		justification := instance.NewJustification(12, gpbft.PREPARE_PHASE, instance.Proposal(), 0, 1)
+		driver.RequireDeliverMessage(&gpbft.GMessage{
+			Sender:        0,
+			Vote:          instance.NewConverge(13, instance.Proposal()),
+			Ticket:        emulator.ValidTicket,
+			Justification: justification,
+		})
+		driver.RequireDeliverMessage(&gpbft.GMessage{
+			Sender:        0,
+			Vote:          instance.NewPrepare(13, instance.Proposal()),
+			Ticket:        emulator.ValidTicket,
+			Justification: justification,
+		})
+
+		requireRebroadcast := func() {
+			driver.RequireQuality()
+			driver.RequireConverge(13, instance.Proposal(), justification)
+			driver.RequireNoBroadcast()
+		}
+
+		driver.RequireConverge(13, instance.Proposal(), justification)       // Should schedule rebroadcast.
+		driver.RequireNoBroadcast()                                          // Assert no broadcast until timeout expires.
+		driver.RequireDeliverAlarm()                                         // Expire the timeout.
+		requireRebroadcast()                                                 // Assert rebroadcast, which should schedule the next rebroadcast.
+		driver.RequireDeliverAlarm()                                         // Trigger alarm
+		requireRebroadcast()                                                 // Expect rebroadcast again, because phase timeout should be enough in the future since we are in round 13.
+		driver.AdvanceTimeBy(24 * time.Hour)                                 // Now, advance the clock beyond the rebroadcast timeout.
+		driver.RequireDeliverAlarm()                                         // Trigger alarm, which should trigger the phase timeout instead of rebroadcast timeout.
+		driver.RequirePrepareAtRound(13, instance.Proposal(), justification) // Expect progress to PREPARE phase; that is no rebroadcast.
+		driver.RequireNoBroadcast()                                          // Expect no further broadcast because PREPARE phase is not timed out yet.
+
+		// Now, because we are beyond round 3, we should expect rebroadcast even though the phase timeout
+		// hasn't expired yet. This is because the rebroadcast is set to trigger immediately beyond round 3.
+		// Therefore, assert that rebroadcast is triggered, and this time it includes a PREPARE message.
+		driver.RequireDeliverAlarm()
+		driver.RequireQuality()
+		driver.RequirePrepareAtRound(13, instance.Proposal(), justification)
+		driver.RequireConverge(13, instance.Proposal(), justification)
+		driver.RequireNoBroadcast() // Nothing else should be broadcast until the next alarm.
+	})
+
+	t.Run("When in PREPARE at round 0", func(t *testing.T) {
+		// Advances the instance to PREPARE at round zero.
+		whenInPrepareAtRoundZero := func(t *testing.T, instance *emulator.Instance, driver *emulator.Driver) {
+			driver.RequireStartInstance(instance.ID())
+			driver.RequireQuality()
+			driver.RequireNoBroadcast()
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender: 1,
+				Vote:   instance.NewQuality(instance.Proposal()),
+			})
+			driver.RequireDeliverAlarm()
+			driver.RequirePrepare(instance.Proposal())
+			driver.RequireNoBroadcast()
+		}
+		t.Run("Justification of COMMIT completes phase", func(t *testing.T) {
+			instance, driver := newInstanceAndDriver(t)
+			whenInPrepareAtRoundZero(t, instance, driver)
+
+			// At this point, sender 0 is in PREPARE phase for the instance proposal. Now,
+			// send a COMMIT message carrying justification of PREPARE from all participants,
+			// which should complete the PREPARE phase immediately even though sender 0
+			// hasn't seen a strong quorum for the instance proposal via PREPARE messages.
+			evidenceOfPrepare := instance.NewJustification(0, gpbft.PREPARE_PHASE, instance.Proposal(), 0, 1)
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender:        1,
+				Vote:          instance.NewCommit(0, instance.Proposal()),
+				Justification: evidenceOfPrepare,
+			})
+			driver.RequireCommit(0, instance.Proposal(), evidenceOfPrepare)
+		})
+		t.Run("Justification of PREPARE from next round completes phase", func(t *testing.T) {
+			instance, driver := newInstanceAndDriver(t)
+			whenInPrepareAtRoundZero(t, instance, driver)
+
+			// At this point, sender 0 is in PREPARE phase for the instance proposal. Now,
+			// send a PREPARE message from round 1 carrying justification of PREPARE from all
+			// participants in round 0, which should complete the PREPARE phase immediately
+			// even though sender 0 hasn't seen a strong quorum for the instance proposal via
+			// PREPARE messages.
+			evidenceOfPrepare := instance.NewJustification(0, gpbft.PREPARE_PHASE, instance.Proposal(), 0, 1)
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender:        1,
+				Vote:          instance.NewPrepare(1, instance.Proposal()),
+				Justification: evidenceOfPrepare,
+			})
+			driver.RequireCommit(0, instance.Proposal(), evidenceOfPrepare)
+		})
+		t.Run("Justification of CONVERGE from next round completes phase", func(t *testing.T) {
+			instance, driver := newInstanceAndDriver(t)
+			whenInPrepareAtRoundZero(t, instance, driver)
+
+			// At this point, sender 0 is in PREPARE phase for the instance proposal. Now,
+			// send a CONVERGE message from round 1 carrying justification of PREPARE from all
+			// participants in round 0, which should complete the PREPARE phase immediately
+			// even though sender 0 hasn't seen a strong quorum for the instance proposal via
+			// PREPARE messages.
+			evidenceOfPrepare := instance.NewJustification(0, gpbft.PREPARE_PHASE, instance.Proposal(), 0, 1)
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender:        1,
+				Vote:          instance.NewConverge(1, instance.Proposal()),
+				Ticket:        emulator.ValidTicket,
+				Justification: evidenceOfPrepare,
+			})
+			driver.RequireCommit(0, instance.Proposal(), evidenceOfPrepare)
+		})
+	})
+
+	t.Run("When in COMMIT for base at round 0", func(t *testing.T) {
+		// Advances the instance to COMMIT for base decision at round zero.
+		whenInCommitForBaseAtRoundZero := func(t *testing.T, instance *emulator.Instance, driver *emulator.Driver) {
+			driver.RequireStartInstance(instance.ID())
+			driver.RequireQuality()
+			driver.RequireNoBroadcast()
+			// Timeout QUALITY phase immediately without delivering any QUALITY messages.
+			driver.RequireDeliverAlarm()
+			// Assert PREPARE phase for base decision and progress PREPARE to commit.
+			driver.RequirePrepare(instance.Proposal().BaseChain())
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender: 1,
+				Vote:   instance.NewPrepare(0, instance.Proposal().BaseChain()),
+			})
+			// Assert COMMIT phase for base decision.
+			driver.RequireCommit(0, instance.Proposal().BaseChain(), instance.NewJustification(0, gpbft.PREPARE_PHASE, instance.Proposal().BaseChain(), 0, 1))
+		}
+		t.Run("Justification of CONVERGE to bottom from next round completes phase", func(t *testing.T) {
+			instance, driver := newInstanceAndDriver(t)
+			whenInCommitForBaseAtRoundZero(t, instance, driver)
+
+			// At this point, sender 0 is in the COMMIT phase for the instance proposal. Now,
+			// send a CONVERGE message from the next round carrying justification as evidence
+			// of COMMIT to the bottom, which should complete the COMMIT phase immediately.
+			evidenceOfCommitToBottom := instance.NewJustification(0, gpbft.COMMIT_PHASE, &gpbft.ECChain{}, 0, 1)
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender:        1,
+				Vote:          instance.NewConverge(1, instance.Proposal().BaseChain()),
+				Ticket:        emulator.ValidTicket,
+				Justification: evidenceOfCommitToBottom,
+			})
+			driver.RequireConverge(1, instance.Proposal().BaseChain(), evidenceOfCommitToBottom)
+		})
+		t.Run("Justification of PREPARE for bottom from next round completes phase", func(t *testing.T) {
+			instance, driver := newInstanceAndDriver(t)
+			whenInCommitForBaseAtRoundZero(t, instance, driver)
+
+			// At this point, sender 0 is in the COMMIT phase for the instance proposal. Now,
+			// send a PREPARE message from the next round carrying justification as evidence
+			// of COMMIT to the bottom, which should complete the COMMIT phase immediately.
+			evidenceOfCommitToBottom := instance.NewJustification(0, gpbft.COMMIT_PHASE, &gpbft.ECChain{}, 0, 1)
+			driver.RequireDeliverMessage(&gpbft.GMessage{
+				Sender:        1,
+				Vote:          instance.NewPrepare(1, instance.Proposal().BaseChain()),
+				Justification: evidenceOfCommitToBottom,
+			})
+			driver.RequireConverge(1, instance.Proposal().BaseChain(), evidenceOfCommitToBottom)
+		})
 	})
 }
 
@@ -620,7 +784,7 @@ func TestGPBFT_WithExactOneThirdToTwoThirdPowerDistribution(t *testing.T) {
 				Vote:   instance.NewPrepare(0, baseChain),
 			},
 		)
-		driver.RequireCommit(0, baseChain, instance.NewJustification(0, gpbft.PREPARE_PHASE, baseChain, 1, 0))
+		driver.RequireCommit(0, baseChain, instance.NewJustification(0, gpbft.PREPARE_PHASE, baseChain, 1))
 
 		// Trigger timeout of COMMIT phase to force a scheduled re-broadcast.
 		driver.RequireDeliverAlarm()

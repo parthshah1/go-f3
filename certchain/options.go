@@ -13,12 +13,11 @@ type Option func(*options) error
 type SignVerifier interface {
 	gpbft.Signer
 	gpbft.Verifier
-	gpbft.SigningMarshaler
 }
 
 type options struct {
 	ec   ec.Backend
-	m    *manifest.Manifest
+	m    manifest.Manifest
 	sv   SignVerifier
 	seed int64
 }
@@ -48,7 +47,7 @@ func WithEC(ec ec.Backend) Option {
 	}
 }
 
-func WithManifest(m *manifest.Manifest) Option {
+func WithManifest(m manifest.Manifest) Option {
 	return func(o *options) error {
 		o.m = m
 		return nil

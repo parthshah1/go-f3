@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -20,7 +21,6 @@ type simHost struct {
 	SimNetwork
 	gpbft.Signer
 	gpbft.Verifier
-	gpbft.SigningMarshaler
 	gpbft.Clock
 
 	id     gpbft.ActorID
@@ -46,20 +46,19 @@ type SimNetwork interface {
 func newHost(id gpbft.ActorID, sim *Simulation, ecg ECChainGenerator, spg StoragePowerGenerator, isAdversary bool) *simHost {
 	pubKey, _ := sim.signingBacked.GenerateKey()
 	return &simHost{
-		SimNetwork:       sim.network.networkFor(sim.signingBacked, id, isAdversary),
-		Verifier:         sim.signingBacked,
-		Signer:           sim.signingBacked,
-		SigningMarshaler: sim.signingBacked,
-		sim:              sim,
-		id:               id,
-		ecg:              ecg,
-		spg:              spg,
-		pubkey:           pubKey,
-		ecChain:          sim.baseChain,
+		SimNetwork: sim.network.networkFor(sim.signingBacked, id, isAdversary),
+		Verifier:   sim.signingBacked,
+		Signer:     sim.signingBacked,
+		sim:        sim,
+		id:         id,
+		ecg:        ecg,
+		spg:        spg,
+		pubkey:     pubKey,
+		ecChain:    sim.baseChain,
 	}
 }
 
-func (v *simHost) GetProposal(instance uint64) (*gpbft.SupplementalData, *gpbft.ECChain, error) {
+func (v *simHost) GetProposal(_ context.Context, instance uint64) (*gpbft.SupplementalData, *gpbft.ECChain, error) {
 	// Use the head of latest agreement chain as the base of next.
 	// TODO: use lookback to return the correct next power table commitment and commitments hash.
 	chain := v.ecg.GenerateECChain(instance, v.ecChain.Head(), v.id)
@@ -84,7 +83,7 @@ func (v *simHost) GetProposal(instance uint64) (*gpbft.SupplementalData, *gpbft.
 	return i.SupplementalData, chain, nil
 }
 
-func (v *simHost) GetCommittee(instance uint64) (*gpbft.Committee, error) {
+func (v *simHost) GetCommittee(_ context.Context, instance uint64) (*gpbft.Committee, error) {
 	i := v.sim.ec.GetInstance(instance)
 	if i == nil {
 		return nil, ErrInstanceUnavailable
@@ -104,7 +103,7 @@ func (v *simHost) Time() time.Time {
 	return v.sim.network.Time()
 }
 
-func (v *simHost) ReceiveDecision(decision *gpbft.Justification) (time.Time, error) {
+func (v *simHost) ReceiveDecision(_ context.Context, decision *gpbft.Justification) (time.Time, error) {
 	v.sim.ec.NotifyDecision(v.id, decision)
 	v.ecChain = decision.Vote.Value
 	return v.Time().Add(v.sim.ecEpochDuration).Add(v.sim.ecStabilisationDelay), nil

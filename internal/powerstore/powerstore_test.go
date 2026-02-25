@@ -34,7 +34,9 @@ func TestPowerStore(t *testing.T) {
 
 	m := manifest.LocalDevnetManifest()
 
-	ec := consensus.NewFakeEC(ctx,
+	ec := consensus.NewFakeEC(
+		consensus.WithClock(clk),
+		consensus.WithNullTipsetProbability(0),
 		consensus.WithMaxLookback(2*m.EC.Finality),
 		consensus.WithBootstrapEpoch(m.BootstrapEpoch),
 		consensus.WithECPeriod(m.EC.Period),
@@ -158,7 +160,7 @@ func TestPowerStore(t *testing.T) {
 
 }
 
-func advanceF3(t *testing.T, m *manifest.Manifest, ps *powerstore.Store, cs *certstore.Store, until int64, epochsPerCert int) {
+func advanceF3(t *testing.T, m manifest.Manifest, ps *powerstore.Store, cs *certstore.Store, until int64, epochsPerCert int) {
 	instance := uint64(0)
 	base := m.BootstrapEpoch - m.EC.Finality
 	if latest := cs.Latest(); latest != nil {

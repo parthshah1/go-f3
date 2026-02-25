@@ -11,6 +11,7 @@ import (
 
 	"github.com/filecoin-project/go-f3"
 	"github.com/filecoin-project/go-f3/certs"
+	"github.com/filecoin-project/go-f3/ec"
 	"github.com/filecoin-project/go-f3/gpbft"
 	"github.com/filecoin-project/go-f3/internal/clock"
 	"github.com/filecoin-project/go-f3/internal/consensus"
@@ -20,6 +21,7 @@ import (
 	"github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/failstore"
 	ds_sync "github.com/ipfs/go-datastore/sync"
+	logging "github.com/ipfs/go-log/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
@@ -28,11 +30,10 @@ import (
 )
 
 const (
-	eventualCheckInterval   = 100 * time.Millisecond
-	eventualCheckTimeout    = time.Minute
-	manifestPublishInterval = 100 * time.Millisecond
-	advanceClockEvery       = 5 * time.Millisecond
-	advanceClockBy          = 100 * time.Millisecond
+	eventualCheckInterval = 5 * time.Millisecond
+	eventualCheckTimeout  = 2 * time.Minute
+	advanceClockEvery     = 5 * time.Millisecond
+	advanceClockBy        = 100 * time.Millisecond
 )
 
 func init() {
@@ -44,17 +45,22 @@ func init() {
 }
 
 func TestF3Simple(t *testing.T) {
-	t.Parallel()
 	env := newTestEnvironment(t).withNodes(2).start()
 	env.requireInstanceEventually(5, eventualCheckTimeout, true)
 	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch, eventualCheckTimeout)
 }
 
 func TestF3WithLookback(t *testing.T) {
-	t.Parallel()
+	// Quiet down the logs since the test asserts a scenario that triggers
+	// OhShitStore ERROR level logs.
+	_ = logging.SetLogLevel("f3/ohshitstore", "DPANIC")
+
+	mfst := base
+	mfst.EC.HeadLookback = 20
+
 	env := newTestEnvironment(t).
 		withNodes(2).
-		withManifest(func(m *manifest.Manifest) { m.EC.HeadLookback = 20 }).
+		withManifest(mfst).
 		start()
 	env.requireInstanceEventually(5, eventualCheckTimeout, true)
 
@@ -88,17 +94,20 @@ func TestF3WithLookback(t *testing.T) {
 	env.requireInstanceEventually(5, eventualCheckTimeout, true)
 }
 
-func TestF3PauseResumeCatchup(t *testing.T) {
-	t.Parallel()
-	env := newTestEnvironment(t).withNodes(3).start()
+func TestF3StopStartCatchup(t *testing.T) {
+	// Quiet down the logs since the test asserts a scenario that triggers
+	// OhShitStore ERROR level logs.
+	_ = logging.SetLogLevel("f3/ohshitstore", "DPANIC")
+
+	env := newTestEnvironment(t).withNodes(4).start()
 	env.requireInstanceEventually(1, eventualCheckTimeout, true)
 	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch, eventualCheckTimeout)
 
 	// Pausing two nodes should pause the network.
-	env.pauseNode(1)
-	env.pauseNode(2)
+	env.stopNode(2)
+	env.stopNode(3)
 
-	env.requireF3NotRunningEventually(eventualCheckTimeout, nodeMatchers.byID(1, 2))
+	env.requireF3NotRunningEventually(eventualCheckTimeout, nodeMatchers.byID(2, 3))
 
 	// Wait until node 0 stops progressing
 	require.Eventually(t, func() bool {
@@ -109,22 +118,23 @@ func TestF3PauseResumeCatchup(t *testing.T) {
 	}, eventualCheckTimeout, eventualCheckInterval)
 
 	// Resuming node 1 should continue agreeing on instances.
-	env.resumeNode(1)
-	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.byID(1))
+	env.startNode(2)
+	env.connectAll()
+	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.byID(2))
 
 	// Wait until we're far enough that pure GPBFT catchup should be impossible.
-	targetInstance := env.nodes[1].currentGpbftInstance() + env.manifest.CommitteeLookback + 1
+	targetInstance := env.nodes[2].currentGpbftInstance() + env.manifest.CommitteeLookback + 1
 	env.requireInstanceEventually(targetInstance, eventualCheckTimeout, false)
 
-	env.resumeNode(2)
-	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.byID(2))
+	env.startNode(3)
+	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.byID(3))
 
 	// Everyone should catch up eventually
 	env.requireInstanceEventually(targetInstance, eventualCheckTimeout, true)
 
 	// Pause the "good" node.
 	node0failInstance := env.nodes[0].currentGpbftInstance()
-	env.pauseNode(0)
+	env.stopNode(0)
 	env.requireF3NotRunningEventually(eventualCheckTimeout, nodeMatchers.byID(0))
 
 	// We should be able to make progress with the remaining nodes.
@@ -132,7 +142,6 @@ func TestF3PauseResumeCatchup(t *testing.T) {
 }
 
 func TestF3FailRecover(t *testing.T) {
-	t.Parallel()
 	env := newTestEnvironment(t).withNodes(2)
 
 	// Make it possible to fail a single write for node 0.
@@ -162,132 +171,7 @@ func TestF3FailRecover(t *testing.T) {
 	env.requireInstanceEventually(oldInstance+3, eventualCheckTimeout, true)
 }
 
-func TestF3DynamicManifest_WithoutChanges(t *testing.T) {
-	t.Parallel()
-	env := newTestEnvironment(t).withNodes(2).withDynamicManifest()
-
-	env.start()
-	prev := env.nodes[0].f3.Manifest()
-
-	env.requireInstanceEventually(5, eventualCheckTimeout, false)
-	// no changes in manifest
-	require.Equal(t, prev, env.nodes[0].f3.Manifest())
-	env.requireConsistentManifest(true)
-}
-
-func TestF3DynamicManifest_WithRebootstrap(t *testing.T) {
-	t.Parallel()
-	env := newTestEnvironment(t).withNodes(2).withDynamicManifest().start()
-
-	prevManifest := env.nodes[0].f3.Manifest()
-	env.requireInstanceEventually(3, eventualCheckTimeout, true)
-
-	for range 2 {
-		nd := env.addNode()
-		pubkey, _ := env.signingBackend.GenerateKey()
-		env.manifest.ExplicitPower = append(env.manifest.ExplicitPower, gpbft.PowerEntry{
-			ID:     gpbft.ActorID(nd.id),
-			PubKey: pubkey,
-			Power:  gpbft.NewStoragePower(1),
-		})
-	}
-
-	env.updateManifest()
-	env.requireManifestPropagatedEventually(eventualCheckTimeout)
-
-	// check that it rebootstrapped and has a new base epoch.
-	targetBaseEpoch := env.manifest.BootstrapEpoch - env.manifest.EC.Finality
-	env.whileAdvancingClock(func() {
-		require.Eventually(t, func() bool {
-			//env.clock.Add(env.manifest.EC.Period)
-			c, err := env.nodes[0].f3.GetCert(env.testCtx, 0)
-			if err != nil || c == nil {
-				return false
-			}
-			return c.ECChain.Base().Epoch == targetBaseEpoch
-		}, eventualCheckTimeout, eventualCheckInterval, "Base epoch on node 0 not reached in time. Environment: %s", env)
-	})
-	env.requireInstanceEventually(3, eventualCheckTimeout, false)
-	require.NotEqual(t, prevManifest, env.nodes[0].f3.Manifest())
-	env.requireConsistentManifest(false)
-
-	// check that the power table is updated
-	ts, err := env.ec.GetTipsetByEpoch(env.testCtx, int64(env.nodes[0].currentGpbftInstance()))
-	require.NoError(t, err)
-	pt, err := env.nodes[0].f3.GetPowerTable(env.testCtx, ts.Key())
-	require.NoError(t, err)
-	require.Equal(t, len(pt), 4)
-}
-
-func TestF3DynamicManifest_WithPauseAndRebootstrap(t *testing.T) {
-	t.Parallel()
-	env := newTestEnvironment(t).withNodes(2).withDynamicManifest().start()
-
-	env.requireInstanceEventually(10, eventualCheckTimeout, true)
-	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch+10, eventualCheckTimeout)
-	cert0, err := env.nodes[0].f3.GetCert(env.testCtx, 0)
-	require.NoError(t, err)
-	FirstFinalizedEpochBeforeRebootstrap := cert0.ECChain.Base().Epoch
-	require.Equal(t, env.manifest.BootstrapEpoch-env.manifest.EC.Finality, FirstFinalizedEpochBeforeRebootstrap)
-
-	env.manifest.Pause = true
-	env.updateManifest()
-	// check that it paused
-	env.requireF3NotRunningEventually(eventualCheckTimeout, nodeMatchers.all)
-
-	env.manifest.BootstrapEpoch += 10
-	env.manifest.Pause = false
-	env.updateManifest()
-	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.all)
-	env.requireManifestPropagatedEventually(eventualCheckTimeout)
-	env.requireConsistentManifest(true)
-
-	env.requireInstanceEventually(3, eventualCheckTimeout, true)
-	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch+10, eventualCheckTimeout)
-
-	// Now check that we have the correct base for certificate 0.
-	cert0, err = env.nodes[0].f3.GetCert(env.testCtx, 0)
-	require.NoError(t, err)
-	require.Equal(t, env.manifest.BootstrapEpoch-env.manifest.EC.Finality, cert0.ECChain.Base().Epoch)
-	require.Less(t, FirstFinalizedEpochBeforeRebootstrap, cert0.ECChain.Base().Epoch)
-}
-
-func TestF3DynamicManifest_RebootstrapWithCompression(t *testing.T) {
-	t.Parallel()
-	env := newTestEnvironment(t).withNodes(2).withDynamicManifest().start()
-
-	env.requireInstanceEventually(10, eventualCheckTimeout, true)
-	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch+10, eventualCheckTimeout)
-	cert0, err := env.nodes[0].f3.GetCert(env.testCtx, 0)
-	require.NoError(t, err)
-	FirstFinalizedEpochBeforeRebootstrap := cert0.ECChain.Base().Epoch
-	require.Equal(t, env.manifest.BootstrapEpoch-env.manifest.EC.Finality, FirstFinalizedEpochBeforeRebootstrap)
-
-	env.manifest.Pause = true
-	env.updateManifest()
-	// check that it paused
-	env.requireF3NotRunningEventually(eventualCheckTimeout, nodeMatchers.all)
-
-	env.manifest.BootstrapEpoch += 10
-	env.manifest.Pause = false
-	env.manifest.PubSub.CompressionEnabled = true
-	env.updateManifest()
-	env.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.all)
-	env.requireManifestPropagatedEventually(eventualCheckTimeout)
-	env.requireConsistentManifest(true)
-
-	env.requireInstanceEventually(3, eventualCheckTimeout, true)
-	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch+10, eventualCheckTimeout)
-
-	// Now check that we have the correct base for certificate 0.
-	cert0, err = env.nodes[0].f3.GetCert(env.testCtx, 0)
-	require.NoError(t, err)
-	require.Equal(t, env.manifest.BootstrapEpoch-env.manifest.EC.Finality, cert0.ECChain.Base().Epoch)
-	require.Less(t, FirstFinalizedEpochBeforeRebootstrap, cert0.ECChain.Base().Epoch)
-}
-
 func TestF3LateBootstrap(t *testing.T) {
-	t.Parallel()
 	env := newTestEnvironment(t).withNodes(2).start()
 
 	// Wait till we're "caught up".
@@ -329,6 +213,46 @@ func TestF3LateBootstrap(t *testing.T) {
 	})
 }
 
+func TestF3EpochFinalizedWithChainExchange(t *testing.T) {
+	env := newTestEnvironment(t).withNodes(2)
+
+	initialPowerTable := gpbft.PowerEntries{}
+	for _, n := range env.nodes {
+		pubkey, _ := env.signingBackend.GenerateKey()
+		initialPowerTable = append(initialPowerTable, gpbft.PowerEntry{
+			ID:     gpbft.ActorID(n.id),
+			PubKey: pubkey,
+			Power:  gpbft.NewStoragePower(1000),
+		})
+	}
+
+	env.ec = consensus.NewFakeEC(
+		consensus.WithClock(env.clock),
+		consensus.WithSeed(1413),
+		consensus.WithBootstrapEpoch(env.manifest.BootstrapEpoch),
+		consensus.WithMaxLookback(2*env.manifest.EC.Finality),
+		consensus.WithECPeriod(env.manifest.EC.Period),
+		consensus.WithInitialPowerTable(initialPowerTable),
+		consensus.WithForkSeed(1414),
+		consensus.WithForkAfterEpochs(10),
+	)
+
+	env.nodes[0].ec = consensus.NewFakeEC(
+		consensus.WithClock(env.clock),
+		consensus.WithSeed(1413),
+		consensus.WithBootstrapEpoch(env.manifest.BootstrapEpoch),
+		consensus.WithMaxLookback(2*env.manifest.EC.Finality),
+		consensus.WithECPeriod(env.manifest.EC.Period),
+		consensus.WithInitialPowerTable(initialPowerTable),
+		consensus.WithForkSeed(1415),
+		consensus.WithForkAfterEpochs(3),
+	)
+	env.start()
+	// Fast forward the clock to force nodes to catch up by generating longer chains.
+	env.clock.Add(1 * time.Hour)
+	env.requireEpochFinalizedEventually(env.manifest.BootstrapEpoch+10, eventualCheckTimeout)
+}
+
 var base = manifest.Manifest{
 	BootstrapEpoch:    50,
 	InitialInstance:   0,
@@ -339,7 +263,7 @@ var base = manifest.Manifest{
 		DeltaBackOffExponent:       1.3,
 		QualityDeltaMultiplier:     1.0,
 		MaxLookaheadRounds:         5,
-		ChainProposedLength:        gpbft.ChainDefaultLen,
+		ChainProposedLength:        30,
 		RebroadcastBackoffBase:     3 * time.Second,
 		RebroadcastBackoffSpread:   0.1,
 		RebroadcastBackoffExponent: 1.3,
@@ -356,7 +280,16 @@ var base = manifest.Manifest{
 	CertificateExchange: manifest.DefaultCxConfig,
 	CatchUpAlignment:    5 * time.Second,
 	PubSub:              manifest.DefaultPubSubConfig,
-	ChainExchange:       manifest.DefaultChainExchangeConfig,
+	ChainExchange: manifest.ChainExchangeConfig{
+		SubscriptionBufferSize:         32,
+		MaxChainLength:                 30,
+		MaxInstanceLookahead:           manifest.DefaultCommitteeLookback,
+		MaxDiscoveredChainsPerInstance: 1_000,
+		MaxWantedChainsPerInstance:     1_000,
+		RebroadcastInterval:            2 * time.Second,
+		MaxTimestampAge:                8 * time.Second,
+	},
+	PartialMessageManager: manifest.DefaultPartialMessageManagerConfig,
 }
 
 type testNode struct {
@@ -365,6 +298,7 @@ type testNode struct {
 	id        int
 	f3        *f3.F3
 	dsErrFunc func(string) error
+	ec        ec.Backend
 }
 
 func (n *testNode) currentGpbftInstance() uint64 {
@@ -388,22 +322,13 @@ func (n *testNode) init() *f3.F3 {
 		return nil
 	}))
 
-	var mprovider manifest.ManifestProvider
-	if n.e.manifestSender != nil {
-		manifestServerID := n.e.manifestSender.SenderID()
-		mprovider, err = manifest.NewDynamicManifestProvider(
-			ps, manifestServerID,
-			manifest.DynamicManifestProviderWithInitialManifest(n.e.currentManifest()),
-		)
-	} else {
-		mprovider, err = manifest.NewStaticManifestProvider(n.e.currentManifest())
+	n.e.signingBackend.Allow(n.id)
+
+	if n.ec == nil {
+		n.ec = n.e.ec
 	}
-	require.NoError(n.e.t, err)
-
-	n.e.signingBackend.Allow(int(n.id))
-
-	n.f3, err = f3.New(n.e.testCtx, mprovider, ds, n.h, ps, n.e.signingBackend, n.e.ec,
-		filepath.Join(n.e.tempDir, fmt.Sprintf("instance-%d", n.id)))
+	n.f3, err = f3.New(n.e.testCtx, n.e.manifest, ds, n.h, ps, n.e.signingBackend, n.ec,
+		filepath.Join(n.e.tempDir, fmt.Sprintf("participant-%d", n.id)))
 	require.NoError(n.e.t, err)
 
 	n.e.errgrp.Go(func() error {
@@ -413,19 +338,19 @@ func (n *testNode) init() *f3.F3 {
 	return n.f3
 }
 
-func (n *testNode) pause() {
-	require.NoError(n.e.t, n.f3.Pause(n.e.testCtx))
+func (n *testNode) stop() {
+	require.NoError(n.e.t, n.f3.Stop(n.e.testCtx))
 }
 
-func (n *testNode) resume() {
-	require.NoError(n.e.t, n.f3.Resume(n.e.testCtx))
+func (n *testNode) start() {
+	require.NoError(n.e.t, n.f3.Start(n.e.testCtx))
 }
 
 type testNodeStatus struct {
 	id          int
 	initialised bool
 	running     bool
-	progress    gpbft.Instant
+	progress    gpbft.InstanceProgress
 	latestCert  *certs.FinalityCertificate
 }
 
@@ -465,54 +390,11 @@ type testEnv struct {
 	signingBackend *signing.FakeBackend
 	nodes          []*testNode
 	ec             *consensus.FakeEC
-	manifestSender *manifest.ManifestSender
 	net            mocknet.Mocknet
 	clock          *clock.Mock
 	tempDir        string // we need to ask for it before any of our cleanup hooks
 
-	manifest        manifest.Manifest
-	manifestVersion uint64
-}
-
-func (e *testEnv) currentManifest() *manifest.Manifest {
-	m := e.manifest
-	if e.manifestSender != nil {
-		nn := fmt.Sprintf("%s/%d", e.manifest.NetworkName, e.manifestVersion)
-		m.NetworkName = gpbft.NetworkName(nn)
-	}
-	return &m
-}
-
-// signals the update to the latest manifest in the environment.
-func (e *testEnv) updateManifest() {
-	e.t.Helper()
-	if e.manifestSender == nil {
-		e.t.Fatal("cannot update manifest unless the dynamic manifest is enabled")
-	}
-	e.manifestVersion++
-	e.manifestSender.UpdateManifest(e.currentManifest())
-}
-
-func (e *testEnv) requireManifestPropagatedEventually(timeout time.Duration) {
-	e.t.Helper()
-	newManifest := e.currentManifest()
-	e.whileAdvancingClock(func() {
-		require.Eventually(e.t, func() bool {
-			for _, n := range e.nodes {
-				if n.f3 == nil {
-					continue
-				}
-				m := n.f3.Manifest()
-				if m == nil {
-					return false
-				}
-				if !newManifest.Equal(m) {
-					return false
-				}
-			}
-			return true
-		}, timeout, eventualCheckInterval, "Manifest did not propagate in time. Environment: %s", e)
-	})
+	manifest manifest.Manifest
 }
 
 // waits for all nodes to reach a specific instance number.
@@ -632,16 +514,6 @@ func (e *testEnv) addNode() *testNode {
 	return n
 }
 
-func (e *testEnv) requireConsistentManifest(strict bool) {
-	m := e.nodes[0].f3.Manifest()
-	for _, n := range e.nodes {
-		// only check running nodes
-		if (n.f3 != nil && n.f3.IsRunning()) || strict {
-			require.Equal(e.t, n.f3.Manifest(), m)
-		}
-	}
-}
-
 type nodeMatcher func(*testNode) bool
 
 var nodeMatchers = struct {
@@ -720,7 +592,8 @@ func (e *testEnv) initialize() *testEnv {
 			})
 		}
 
-		e.ec = consensus.NewFakeEC(e.testCtx,
+		e.ec = consensus.NewFakeEC(
+			consensus.WithClock(e.clock),
 			consensus.WithSeed(1413),
 			consensus.WithBootstrapEpoch(e.manifest.BootstrapEpoch),
 			consensus.WithMaxLookback(2*e.manifest.EC.Finality),
@@ -749,39 +622,20 @@ func (e *testEnv) start() *testEnv {
 	// wait for nodes to initialize
 	e.requireF3RunningEventually(eventualCheckTimeout, nodeMatchers.all)
 
-	// If it exists, start the manifest sender
-	if e.manifestSender != nil {
-		go func() {
-			require.NoError(e.t, e.manifestSender.Run(e.testCtx))
-		}()
-	}
 	return e
 }
 
-func (e *testEnv) withManifest(fn func(m *manifest.Manifest)) *testEnv {
-	fn(&e.manifest)
+func (e *testEnv) withManifest(m manifest.Manifest) *testEnv {
+	e.manifest = m
 	return e
 }
 
-func (e *testEnv) pauseNode(i int) {
-	e.nodes[i].pause()
+func (e *testEnv) stopNode(i int) {
+	e.nodes[i].stop()
 }
 
-func (e *testEnv) resumeNode(i int) {
-	e.nodes[i].resume()
-}
-
-func (e *testEnv) withDynamicManifest() *testEnv {
-	h, err := e.net.GenPeer()
-	require.NoError(e.t, err)
-
-	ps, err := pubsub.NewGossipSub(e.testCtx, h, pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign))
-	require.NoError(e.t, err)
-
-	e.manifestSender, err = manifest.NewManifestSender(e.testCtx, h, ps, e.currentManifest(), manifestPublishInterval)
-	require.NoError(e.t, err)
-
-	return e
+func (e *testEnv) startNode(i int) {
+	e.nodes[i].start()
 }
 
 func (e *testEnv) injectDatastoreFailures(i int, fn func(op string) error) {

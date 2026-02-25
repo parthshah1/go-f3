@@ -1,10 +1,7 @@
 package gpbft
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -14,163 +11,11 @@ import (
 
 	"github.com/filecoin-project/go-bitfield"
 	rlepluslazy "github.com/filecoin-project/go-bitfield/rle"
-	"github.com/ipfs/go-cid"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
-type Phase uint8
-
-const (
-	INITIAL_PHASE Phase = iota
-	QUALITY_PHASE
-	CONVERGE_PHASE
-	PREPARE_PHASE
-	COMMIT_PHASE
-	DECIDE_PHASE
-	TERMINATED_PHASE
-)
-
-func (p Phase) String() string {
-	switch p {
-	case INITIAL_PHASE:
-		return "INITIAL"
-	case QUALITY_PHASE:
-		return "QUALITY"
-	case CONVERGE_PHASE:
-		return "CONVERGE"
-	case PREPARE_PHASE:
-		return "PREPARE"
-	case COMMIT_PHASE:
-		return "COMMIT"
-	case DECIDE_PHASE:
-		return "DECIDE"
-	case TERMINATED_PHASE:
-		return "TERMINATED"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 const DomainSeparationTag = "GPBFT"
-
-// A message in the Granite protocol.
-// The same message structure is used for all rounds and phases.
-// Note that the message is self-attesting so no separate envelope or signature is needed.
-// - The signature field fixes the included sender ID via the implied public key;
-// - The signature payload includes all fields a sender can freely choose;
-// - The ticket field is a signature of the same public key, so also self-attesting.
-type GMessage struct {
-	// ID of the sender/signer of this message (a miner actor ID).
-	Sender ActorID
-	// Vote is the payload that is signed by the signature
-	Vote Payload
-	// Signature by the sender's public key over Instance || Round || Phase || Value.
-	Signature []byte `cborgen:"maxlen=96"`
-	// VRF ticket for CONVERGE messages (otherwise empty byte array).
-	Ticket Ticket `cborgen:"maxlen=96"`
-	// Justification for this message (some messages must be justified by a strong quorum of messages from some previous phase).
-	Justification *Justification
-}
-
-type Justification struct {
-	// Vote is the payload that is signed by the signature
-	Vote Payload
-	// Indexes in the base power table of the signers (bitset)
-	Signers bitfield.BitField
-	// BLS aggregate signature of signers
-	Signature []byte `cborgen:"maxlen=96"`
-}
-
-type SupplementalData struct {
-	// Merkle-tree of instance-specific commitments. Currently empty but this will eventually
-	// include things like snark-friendly power-table commitments.
-	Commitments [32]byte `cborgen:"maxlen=32"`
-	// The DagCBOR-blake2b256 CID of the power table used to validate the next instance, taking
-	// lookback into account.
-	PowerTable cid.Cid // []PowerEntry
-}
-
-func (d *SupplementalData) Eq(other *SupplementalData) bool {
-	return d.Commitments == other.Commitments && d.PowerTable == other.PowerTable
-}
-
-// Custom JSON marshalling for SupplementalData to achieve a commitment field
-// that is a base64-encoded string.
-
-type supplementalDataSub SupplementalData
-type supplementalDataJson struct {
-	Commitments []byte
-	*supplementalDataSub
-}
-
-func (sd SupplementalData) MarshalJSON() ([]byte, error) {
-	return json.Marshal(&supplementalDataJson{
-		Commitments:         sd.Commitments[:],
-		supplementalDataSub: (*supplementalDataSub)(&sd),
-	})
-}
-
-func (sd *SupplementalData) UnmarshalJSON(b []byte) error {
-	aux := &supplementalDataJson{supplementalDataSub: (*supplementalDataSub)(sd)}
-	var err error
-	if err = json.Unmarshal(b, &aux); err != nil {
-		return err
-	}
-	if len(aux.Commitments) != 32 {
-		return errors.New("commitments must be 32 bytes")
-	}
-	copy(sd.Commitments[:], aux.Commitments)
-	return nil
-}
-
-// Fields of the message that make up the signature payload.
-type Payload struct {
-	// GossiPBFT instance (epoch) number.
-	Instance uint64
-	// GossiPBFT round number.
-	Round uint64
-	// GossiPBFT phase name.
-	Phase Phase
-	// The common data.
-	SupplementalData SupplementalData
-	// The value agreed-upon in a single instance.
-	Value *ECChain
-}
-
-func (p *Payload) Eq(other *Payload) bool {
-	if p == other {
-		return true
-	}
-	if other == nil {
-		return false
-	}
-	return p.Instance == other.Instance &&
-		p.Round == other.Round &&
-		p.Phase == other.Phase &&
-		p.SupplementalData.Eq(&other.SupplementalData) &&
-		p.Value.Eq(other.Value)
-}
-
-func (p *Payload) MarshalForSigning(nn NetworkName) []byte {
-	var buf bytes.Buffer
-	buf.WriteString(DomainSeparationTag)
-	buf.WriteString(":")
-	buf.WriteString(string(nn))
-	buf.WriteString(":")
-
-	_ = binary.Write(&buf, binary.BigEndian, p.Phase)
-	_ = binary.Write(&buf, binary.BigEndian, p.Round)
-	_ = binary.Write(&buf, binary.BigEndian, p.Instance)
-	_, _ = buf.Write(p.SupplementalData.Commitments[:])
-	key := p.Value.Key()
-	_, _ = buf.Write(key[:])
-	_, _ = buf.Write(p.SupplementalData.PowerTable.Bytes())
-	return buf.Bytes()
-}
-
-func (m GMessage) String() string {
-	return fmt.Sprintf("%s{%d}(%d %s)", m.Vote.Phase, m.Vote.Instance, m.Vote.Round, m.Vote.Value)
-}
 
 // A single Granite consensus instance.
 type instance struct {
@@ -185,7 +30,7 @@ type instance struct {
 	beacon []byte
 	// current stores information about the current GPBFT instant in terms of
 	// instance ID, round and phase.
-	current Instant
+	current InstanceProgress
 	// Time at which the current phase can or must end.
 	// For QUALITY, PREPARE, and COMMIT, this is the latest time (the phase can end sooner).
 	// For CONVERGE, this is the exact time (the timeout solely defines the phase end).
@@ -242,10 +87,15 @@ func newInstance(
 	if input.IsZero() {
 		return nil, fmt.Errorf("input is empty")
 	}
+
 	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrInitialPhase))
 	metrics.currentInstance.Record(context.TODO(), int64(instanceID))
 	metrics.currentPhase.Record(context.TODO(), int64(INITIAL_PHASE))
-	metrics.currentRound.Record(context.TODO(), 0)
+	metrics.currentRound.Record(context.TODO(), int64(0))
+	{
+		totalPowerFloat, _ := powerTable.Total.Float64()
+		metrics.totalPower.Record(context.TODO(), totalPowerFloat)
+	}
 
 	return &instance{
 		participant:       participant,
@@ -253,10 +103,13 @@ func newInstance(
 		powerTable:        powerTable,
 		aggregateVerifier: aggregateVerifier,
 		beacon:            beacon,
-		current: Instant{
-			ID:    instanceID,
-			Round: 0,
-			Phase: INITIAL_PHASE,
+		current: InstanceProgress{
+			Instant: Instant{
+				ID:    instanceID,
+				Round: 0,
+				Phase: INITIAL_PHASE,
+			},
+			Input: input,
 		},
 		supplementalData: data,
 		proposal:         input,
@@ -264,11 +117,11 @@ func newInstance(
 		candidates: map[ECChainKey]struct{}{
 			input.BaseChain().Key(): {},
 		},
-		quality: newQuorumState(powerTable),
+		quality: newQuorumState(powerTable, attrQualityPhase, attrKeyRound.Int(0)),
 		rounds: map[uint64]*roundState{
-			0: newRoundState(powerTable),
+			0: newRoundState(0, powerTable),
 		},
-		decision: newQuorumState(powerTable),
+		decision: newQuorumState(powerTable, attrDecidePhase, attrKeyRound.Int(0)),
 		tracer:   participant.tracer,
 	}, nil
 }
@@ -279,11 +132,12 @@ type roundState struct {
 	committed *quorumState
 }
 
-func newRoundState(powerTable *PowerTable) *roundState {
+func newRoundState(roundNumber uint64, powerTable *PowerTable) *roundState {
+	roundAttr := attrKeyRound.Int(int(roundNumber))
 	return &roundState{
-		converged: newConvergeState(),
-		prepared:  newQuorumState(powerTable),
-		committed: newQuorumState(powerTable),
+		converged: newConvergeState(roundAttr),
+		prepared:  newQuorumState(powerTable, attrPreparePhase, roundAttr),
+		committed: newQuorumState(powerTable, attrCommitPhase, roundAttr),
 	}
 }
 
@@ -410,11 +264,20 @@ func (i *instance) receiveOne(msg *GMessage) (bool, error) {
 		}
 	case PREPARE_PHASE:
 		msgRound.prepared.Receive(msg.Sender, msg.Vote.Value, msg.Signature)
+
+		// All PREPARE messages beyond round zero carry either justification of COMMIT
+		// for bottom or PREPARE for vote value from their previous round. Collect such
+		// justifications to potentially advance the current round at COMMIT or PREPARE
+		// by reusing the same justification as evidence of strong quorum.
+		if msg.Justification != nil {
+			msgRound.prepared.ReceiveJustification(msg.Vote.Value, msg.Justification)
+		}
 	case COMMIT_PHASE:
 		msgRound.committed.Receive(msg.Sender, msg.Vote.Value, msg.Signature)
-		// The only justifications that need to be stored for future propagation are for COMMITs
-		// to non-bottom values.
-		// This evidence can be brought forward to justify a CONVERGE message in the next round.
+		// The only justifications that need to be stored for future propagation are for
+		// COMMITs to non-bottom values. This evidence can be brought forward to justify
+		// a CONVERGE message in the next round, or justify progress from PREPARE in the
+		// current round.
 		if !msg.Vote.Value.IsZero() {
 			msgRound.committed.ReceiveJustification(msg.Vote.Value, msg.Justification)
 		}
@@ -422,8 +285,20 @@ func (i *instance) receiveOne(msg *GMessage) (bool, error) {
 		// to a new round. Late-arriving COMMITs can still (must) cause a local decision,
 		// *in that round*. Try to complete the COMMIT phase for the round specified by
 		// the message.
+		//
+		// Otherwise, if the COMMIT message hasn't resulted in progress of the current
+		// round, continue to try the current phase. Because, the COMMIT message may
+		// justify PREPARE in the current round if the participant is currently in
+		// PREPARE phase.
 		if i.current.Phase != DECIDE_PHASE {
-			return true, i.tryCommit(msg.Vote.Round)
+			err := i.tryCommit(msg.Vote.Round)
+			// Proceed to attempt to complete the current phase only if the COMMIT message
+			// could potentially justify the current round's PREPARE phase. Otherwise,
+			// there's no point in trying to complete the current phase.
+			tryToCompleteCurrentPhase := err == nil && i.current.Phase == PREPARE_PHASE && i.current.Round == msg.Vote.Round && !msg.Vote.Value.IsZero()
+			if !tryToCompleteCurrentPhase {
+				return true, err
+			}
 		}
 	case DECIDE_PHASE:
 		i.decision.Receive(msg.Sender, msg.Vote.Value, msg.Signature)
@@ -442,8 +317,7 @@ func (i *instance) postReceive(roundsReceived ...uint64) {
 	// Check whether the instance should skip ahead to future round, in descending order.
 	slices.Reverse(roundsReceived)
 	for _, r := range roundsReceived {
-		round := i.getRound(r)
-		if chain, justification, skip := i.shouldSkipToRound(r, round); skip {
+		if chain, justification, skip := i.shouldSkipToRound(r); skip {
 			i.skipToRound(r, chain, justification)
 			return
 		}
@@ -455,7 +329,8 @@ func (i *instance) postReceive(roundsReceived ...uint64) {
 // proposal. Otherwise, it returns nil chain, nil justification and false.
 //
 // See: skipToRound.
-func (i *instance) shouldSkipToRound(round uint64, state *roundState) (*ECChain, *Justification, bool) {
+func (i *instance) shouldSkipToRound(round uint64) (*ECChain, *Justification, bool) {
+	state := i.getRound(round)
 	// Check if the given round is ahead of current round and this instance is not in
 	// DECIDE phase.
 	if round <= i.current.Round || i.current.Phase == DECIDE_PHASE {
@@ -495,6 +370,14 @@ func (i *instance) tryCurrentPhase() error {
 	}
 }
 
+func (i *instance) reportPhaseMetrics() {
+	attr := metric.WithAttributes(attrPhase[i.current.Phase])
+
+	metrics.phaseCounter.Add(context.TODO(), 1, attr)
+	metrics.currentPhase.Record(context.TODO(), int64(i.current.Phase))
+	metrics.proposalLength.Record(context.TODO(), int64(i.proposal.Len()-1), attr)
+}
+
 // Sends this node's QUALITY message and begins the QUALITY phase.
 func (i *instance) beginQuality() error {
 	if i.current.Phase != INITIAL_PHASE {
@@ -506,8 +389,7 @@ func (i *instance) beginQuality() error {
 	i.phaseTimeout = i.alarmAfterSynchronyWithMulti(i.participant.qualityDeltaMulti)
 	i.resetRebroadcastParams()
 	i.broadcast(i.current.Round, QUALITY_PHASE, i.proposal, false, nil)
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrQualityPhase))
-	metrics.currentPhase.Record(context.TODO(), int64(QUALITY_PHASE))
+	i.reportPhaseMetrics()
 	return nil
 }
 
@@ -520,7 +402,7 @@ func (i *instance) tryQuality() error {
 	// Wait either for a strong quorum that agree on our proposal, or for the timeout
 	// to expire.
 	foundQuorum := i.quality.HasStrongQuorumFor(i.proposal.Key())
-	timeoutExpired := atOrAfter(i.participant.host.Time(), i.phaseTimeout)
+	timeoutExpired := i.phaseTimeoutElapsed()
 
 	if foundQuorum || timeoutExpired {
 		// If strong quorum of input is found the proposal will remain unchanged.
@@ -567,8 +449,7 @@ func (i *instance) beginConverge(justification *Justification) {
 	i.getRound(i.current.Round).converged.SetSelfValue(i.proposal, justification)
 
 	i.broadcast(i.current.Round, CONVERGE_PHASE, i.proposal, true, justification)
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrConvergePhase))
-	metrics.currentPhase.Record(context.TODO(), int64(CONVERGE_PHASE))
+	i.reportPhaseMetrics()
 }
 
 // Attempts to end the CONVERGE phase and begin PREPARE based on current state.
@@ -577,8 +458,11 @@ func (i *instance) tryConverge() error {
 		return fmt.Errorf("unexpected phase %s, expected %s", i.current.Phase, CONVERGE_PHASE)
 	}
 	// The CONVERGE phase timeout doesn't wait to hear from >⅔ of power.
-	timeoutExpired := atOrAfter(i.participant.host.Time(), i.phaseTimeout)
+	timeoutExpired := i.phaseTimeoutElapsed()
 	if !timeoutExpired {
+		if i.shouldRebroadcast() {
+			i.tryRebroadcast()
+		}
 		return nil
 	}
 	commitRoundState := i.getRound(i.current.Round - 1).committed
@@ -625,8 +509,7 @@ func (i *instance) beginPrepare(justification *Justification) {
 	i.resetRebroadcastParams()
 
 	i.broadcast(i.current.Round, PREPARE_PHASE, i.value, false, justification)
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrPreparePhase))
-	metrics.currentPhase.Record(context.TODO(), int64(PREPARE_PHASE))
+	i.reportPhaseMetrics()
 }
 
 // Attempts to end the PREPARE phase and begin COMMIT based on current state.
@@ -635,22 +518,31 @@ func (i *instance) tryPrepare() error {
 		return fmt.Errorf("unexpected phase %s, expected %s", i.current.Phase, PREPARE_PHASE)
 	}
 
-	prepared := i.getRound(i.current.Round).prepared
+	currentRound := i.getRound(i.current.Round)
+	prepared := currentRound.prepared
 	proposalKey := i.proposal.Key()
 	foundQuorum := prepared.HasStrongQuorumFor(proposalKey)
-	timedOut := atOrAfter(i.participant.host.Time(), i.phaseTimeout)
 	quorumNotPossible := !prepared.CouldReachStrongQuorumFor(proposalKey, false)
-	phaseComplete := timedOut && prepared.ReceivedFromStrongQuorum()
+	phaseComplete := i.phaseTimeoutElapsed() && prepared.ReceivedFromStrongQuorum()
 
-	if foundQuorum {
+	// Check if the proposal has been justified by COMMIT messages at the current
+	// round or PREPARE/CONVERGE message from the next round. This indicates that
+	// there exists a strong quorum of PREPARE for the proposal at the current round
+	// but hasn't been seen yet by this participant.
+	nextRound := i.getRound(i.current.Round + 1)
+	foundJustification := currentRound.committed.HasJustificationOf(PREPARE_PHASE, proposalKey) ||
+		nextRound.prepared.HasJustificationOf(PREPARE_PHASE, proposalKey) ||
+		nextRound.converged.HasJustificationOf(PREPARE_PHASE, proposalKey)
+
+	if foundQuorum || foundJustification {
 		i.value = i.proposal
 	} else if quorumNotPossible || phaseComplete {
 		i.value = &ECChain{}
 	}
 
-	if foundQuorum || quorumNotPossible || phaseComplete {
+	if foundQuorum || foundJustification || quorumNotPossible || phaseComplete {
 		i.beginCommit()
-	} else if timedOut {
+	} else if i.shouldRebroadcast() {
 		i.tryRebroadcast()
 	}
 	return nil
@@ -667,17 +559,25 @@ func (i *instance) beginCommit() {
 	// No justification is required for committing bottom.
 	var justification *Justification
 	if !i.value.IsZero() {
-		if quorum, ok := i.getRound(i.current.Round).prepared.FindStrongQuorumFor(i.value.Key()); ok {
+		valueKey := i.value.Key()
+		currentRound := i.getRound(i.current.Round)
+		nextRound := i.getRound(i.current.Round + 1)
+		if quorum, ok := currentRound.prepared.FindStrongQuorumFor(valueKey); ok {
 			// Found a strong quorum of PREPARE, build the justification for it.
 			justification = i.buildJustification(quorum, i.current.Round, PREPARE_PHASE, i.value)
+		} else if justifiedByCommit := currentRound.committed.GetJustificationOf(PREPARE_PHASE, valueKey); justifiedByCommit != nil {
+			justification = justifiedByCommit
+		} else if justifiedByNextPrepare := nextRound.prepared.GetJustificationOf(PREPARE_PHASE, valueKey); justifiedByNextPrepare != nil {
+			justification = justifiedByNextPrepare
+		} else if justifiedByNextConverge := nextRound.converged.GetJustificationOf(PREPARE_PHASE, valueKey); justifiedByNextConverge != nil {
+			justification = justifiedByNextConverge
 		} else {
 			panic("beginCommit with no strong quorum for non-bottom value")
 		}
 	}
 
 	i.broadcast(i.current.Round, COMMIT_PHASE, i.value, false, justification)
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrCommitPhase))
-	metrics.currentPhase.Record(context.TODO(), int64(COMMIT_PHASE))
+	i.reportPhaseMetrics()
 }
 
 func (i *instance) tryCommit(round uint64) error {
@@ -687,8 +587,16 @@ func (i *instance) tryCommit(round uint64) error {
 	// no check on the current phase.
 	committed := i.getRound(round).committed
 	quorumValue, foundStrongQuorum := committed.FindStrongQuorumValue()
-	timedOut := atOrAfter(i.participant.host.Time(), i.phaseTimeout)
-	phaseComplete := timedOut && committed.ReceivedFromStrongQuorum()
+	phaseComplete := i.phaseTimeoutElapsed() && committed.ReceivedFromStrongQuorum()
+
+	nextRound := i.getRound(round + 1)
+	bottomKey := bottomECChain.Key()
+	// Check for justification of COMMIT for bottom that may have been received in
+	// a message from the next round at PREPARE or CONVERGE phases. This indicates a
+	// strong quorum of COMMIT for bottom across the participants at current round
+	// even if this participant hasn't yet seen it.
+	foundJustificationForBottom := nextRound.prepared.HasJustificationOf(COMMIT_PHASE, bottomKey) ||
+		nextRound.converged.HasJustificationOf(COMMIT_PHASE, bottomKey)
 
 	switch {
 	case foundStrongQuorum && !quorumValue.IsZero():
@@ -700,7 +608,7 @@ func (i *instance) tryCommit(round uint64) error {
 	case i.current.Round != round, i.current.Phase != COMMIT_PHASE:
 		// We are at a phase other than COMMIT or round does not match the current one;
 		// nothing else to do.
-	case foundStrongQuorum:
+	case foundStrongQuorum, foundJustificationForBottom:
 		// There is a strong quorum for bottom, carry forward the existing proposal.
 		i.beginNextRound()
 	case phaseComplete:
@@ -724,7 +632,7 @@ func (i *instance) tryCommit(round uint64) error {
 			}
 		}
 		i.beginNextRound()
-	case timedOut:
+	case i.shouldRebroadcast():
 		// The phase has timed out. Attempt to re-broadcast messages.
 		i.tryRebroadcast()
 	}
@@ -750,8 +658,7 @@ func (i *instance) beginDecide(round uint64) {
 	// Since each node sends only one DECIDE message, they must share the same vote
 	// in order to be aggregated.
 	i.broadcast(0, DECIDE_PHASE, i.value, false, justification)
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrDecidePhase))
-	metrics.currentPhase.Record(context.TODO(), int64(DECIDE_PHASE))
+	i.reportPhaseMetrics()
 }
 
 // Skips immediately to the DECIDE phase and sends a DECIDE message
@@ -765,9 +672,8 @@ func (i *instance) skipToDecide(value *ECChain, justification *Justification) {
 	i.resetRebroadcastParams()
 	i.broadcast(0, DECIDE_PHASE, i.value, false, justification)
 
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrDecidePhase))
-	metrics.currentPhase.Record(context.TODO(), int64(DECIDE_PHASE))
 	metrics.skipCounter.Add(context.TODO(), 1, metric.WithAttributes(attrSkipToDecide))
+	i.reportPhaseMetrics()
 }
 
 func (i *instance) tryDecide() error {
@@ -788,7 +694,7 @@ func (i *instance) tryDecide() error {
 func (i *instance) getRound(r uint64) *roundState {
 	round, ok := i.rounds[r]
 	if !ok {
-		round = newRoundState(i.powerTable)
+		round = newRoundState(r, i.powerTable)
 		i.rounds[r] = round
 	}
 	return round
@@ -801,17 +707,23 @@ func (i *instance) beginNextRound() {
 	i.current.Round += 1
 	metrics.currentRound.Record(context.TODO(), int64(i.current.Round))
 
-	prevRound := i.getRound(i.current.Round - 1)
+	currentRound := i.getRound(i.current.Round)
+	previousRound := i.getRound(i.current.Round - 1)
+	bottomKey := bottomECChain.Key()
 	// Proposal was updated at the end of COMMIT phase to be some value for which
 	// this node received a COMMIT message (bearing justification), if there were any.
 	// If there were none, there must have been a strong quorum for bottom instead.
 	var justification *Justification
-	if quorum, ok := prevRound.committed.FindStrongQuorumFor(bottomECChain.Key()); ok {
+	if quorum, ok := previousRound.committed.FindStrongQuorumFor(bottomKey); ok {
 		// Build justification for strong quorum of COMMITs for bottom in the previous round.
 		justification = i.buildJustification(quorum, i.current.Round-1, COMMIT_PHASE, nil)
+	} else if bottomJustifiedByPrepare := currentRound.prepared.GetJustificationOf(COMMIT_PHASE, bottomKey); bottomJustifiedByPrepare != nil {
+		justification = bottomJustifiedByPrepare
+	} else if bottomJustifiedByConverge := currentRound.converged.GetJustificationOf(COMMIT_PHASE, bottomKey); bottomJustifiedByConverge != nil {
+		justification = bottomJustifiedByConverge
 	} else {
 		// Extract the justification received from some participant (possibly this node itself).
-		justification, ok = prevRound.committed.receivedJustification[i.proposal.Key()]
+		justification, ok = previousRound.committed.receivedJustification[i.proposal.Key()]
 		if !ok {
 			panic("beginConverge called but no justification for proposal")
 		}
@@ -869,9 +781,8 @@ func (i *instance) terminate(decision *Justification) {
 	i.terminationValue = decision
 	i.resetRebroadcastParams()
 
-	metrics.phaseCounter.Add(context.TODO(), 1, metric.WithAttributes(attrTerminatedPhase))
 	metrics.roundHistogram.Record(context.TODO(), int64(i.current.Round))
-	metrics.currentPhase.Record(context.TODO(), int64(TERMINATED_PHASE))
+	i.reportPhaseMetrics()
 }
 
 func (i *instance) terminated() bool {
@@ -888,11 +799,10 @@ func (i *instance) broadcast(round uint64, phase Phase, value *ECChain, createTi
 	}
 
 	mb := &MessageBuilder{
-		NetworkName:      i.participant.host.NetworkName(),
-		PowerTable:       i.powerTable,
-		SigningMarshaler: i.participant.host,
-		Payload:          p,
-		Justification:    justification,
+		NetworkName:   i.participant.host.NetworkName(),
+		PowerTable:    i.powerTable,
+		Payload:       p,
+		Justification: justification,
 	}
 	if createTicket {
 		mb.BeaconForTicket = i.beacon
@@ -917,16 +827,39 @@ func (i *instance) tryRebroadcast() {
 		// instance phase and schedule the first alarm:
 		//  * If in DECIDE phase, use current time as offset. Because, DECIDE phase does
 		//    not have any phase timeout and may be too far in the past.
+		//  * If the current phase is beyond the immediate rebroadcast threshold, use
+		//    the current time as offset to avoid extended periods of radio silence
+		//    when phase timeout grows exponentially large.
 		//  * Otherwise, use the phase timeout.
 		var rebroadcastTimeoutOffset time.Time
-		if i.current.Phase == DECIDE_PHASE {
+		if i.current.Phase == DECIDE_PHASE || i.current.Round > i.participant.rebroadcastImmediatelyAfterRound {
 			rebroadcastTimeoutOffset = i.participant.host.Time()
 		} else {
 			rebroadcastTimeoutOffset = i.phaseTimeout
 		}
 		i.rebroadcastTimeout = rebroadcastTimeoutOffset.Add(i.participant.rebroadcastAfter(0))
-		i.participant.host.SetAlarm(i.rebroadcastTimeout)
-		i.log("scheduled initial rebroadcast at %v", i.rebroadcastTimeout)
+		if i.phaseTimeoutElapsed() {
+			// The phase timeout has already elapsed; therefore, there's no risk of
+			// overriding any existing alarm. Simply set the alarm for rebroadcast.
+			i.participant.host.SetAlarm(i.rebroadcastTimeout)
+			i.log("scheduled initial rebroadcast at %v", i.rebroadcastTimeout)
+		} else if i.rebroadcastTimeout.Before(i.phaseTimeout) {
+			// The rebroadcast timeout is set before the phase timeout; therefore, it should
+			// trigger before the phase timeout. Override the alarm with rebroadcast timeout
+			// and check for phase timeout in the next cycle of rebroadcast.
+			i.participant.host.SetAlarm(i.rebroadcastTimeout)
+			i.log("scheduled initial rebroadcast at %v before phase timeout at %v", i.rebroadcastTimeout, i.phaseTimeout)
+		} else {
+			// The phase timeout is set before the rebroadcast timeout. Therefore, there must
+			// have been an alarm set already for the phase. Do nothing, because the GPBFT
+			// process loop will trigger the phase alarm, which in turn tries the current
+			// phase and eventually will try rebroadcast.
+			//
+			// Therefore, reset the rebroadcast parameters to re-attempt setting the initial
+			// rebroadcast timeout once the phase expires.
+			i.log("Resetting rebroadcast as rebroadcast timeout at %v is after phase timeout at %v and the current phase has not timed out yet.", i.rebroadcastTimeout, i.phaseTimeout)
+			i.resetRebroadcastParams()
+		}
 	case i.rebroadcastTimeoutElapsed():
 		// Rebroadcast now that the corresponding timeout has elapsed, and schedule the
 		// successive rebroadcast.
@@ -935,13 +868,27 @@ func (i *instance) tryRebroadcast() {
 
 		// Use current host time as the offset for the next alarm to assure that rate of
 		// broadcasted messages grows relative to the actual time at which an alarm is
-		// triggered , not the absolute alarm time. This would avoid a "runaway
+		// triggered, not the absolute alarm time. This would avoid a "runaway
 		// rebroadcast" scenario where rebroadcast timeout consistently remains behind
 		// current time due to the discrepancy between set alarm time and the actual time
 		// at which the alarm is triggered.
 		i.rebroadcastTimeout = i.participant.host.Time().Add(i.participant.rebroadcastAfter(i.rebroadcastAttempts))
-		i.participant.host.SetAlarm(i.rebroadcastTimeout)
-		i.log("scheduled next rebroadcast at %v", i.rebroadcastTimeout)
+		if i.phaseTimeoutElapsed() {
+			// The phase timeout has already elapsed; therefore, there's no risk of
+			// overriding any existing alarm. Simply set the alarm for rebroadcast.
+			i.participant.host.SetAlarm(i.rebroadcastTimeout)
+			i.log("scheduled next rebroadcast at %v", i.rebroadcastTimeout)
+		} else if i.rebroadcastTimeout.Before(i.phaseTimeout) {
+			// The rebroadcast timeout is set before the phase timeout; therefore, it should
+			// trigger before the phase timeout. Override the alarm with rebroadcast timeout
+			// and check for phase timeout in the next cycle of rebroadcast.
+			i.participant.host.SetAlarm(i.rebroadcastTimeout)
+			i.log("scheduled next rebroadcast at %v before phase timeout at %v", i.rebroadcastTimeout, i.phaseTimeout)
+		} else {
+			// The rebroadcast timeout is set after the phase timeout. Set the alarm for phase timeout instead.
+			i.log("Reverted to phase timeout at %v as it is before the next rebroadcast timeout at %v", i.phaseTimeout, i.rebroadcastTimeout)
+			i.participant.host.SetAlarm(i.phaseTimeout)
+		}
 	default:
 		// Rebroadcast timeout is set but has not elapsed yet; nothing to do.
 	}
@@ -955,6 +902,14 @@ func (i *instance) resetRebroadcastParams() {
 func (i *instance) rebroadcastTimeoutElapsed() bool {
 	now := i.participant.host.Time()
 	return atOrAfter(now, i.rebroadcastTimeout)
+}
+
+func (i *instance) shouldRebroadcast() bool {
+	return i.phaseTimeoutElapsed() || i.current.Round > i.participant.rebroadcastImmediatelyAfterRound
+}
+
+func (i *instance) phaseTimeoutElapsed() bool {
+	return atOrAfter(i.participant.host.Time(), i.phaseTimeout)
 }
 
 func (i *instance) rebroadcast() {
@@ -1060,6 +1015,8 @@ type quorumState struct {
 	powerTable *PowerTable
 	// Stores justifications received for some value.
 	receivedJustification map[ECChainKey]*Justification
+	// attributes for metrics
+	attributes []attribute.KeyValue
 }
 
 // A chain value and the total power supporting it
@@ -1071,12 +1028,13 @@ type chainSupport struct {
 }
 
 // Creates a new, empty quorum state.
-func newQuorumState(powerTable *PowerTable) *quorumState {
+func newQuorumState(powerTable *PowerTable, attributes ...attribute.KeyValue) *quorumState {
 	return &quorumState{
 		senders:               map[ActorID]struct{}{},
 		chainSupport:          map[ECChainKey]chainSupport{},
 		powerTable:            powerTable,
 		receivedJustification: map[ECChainKey]*Justification{},
+		attributes:            attributes,
 	}
 }
 
@@ -1115,6 +1073,11 @@ func (q *quorumState) receiveSender(sender ActorID) (int64, bool) {
 	q.senders[sender] = struct{}{}
 	senderPower, _ := q.powerTable.Get(sender)
 	q.sendersTotalPower += senderPower
+	if len(q.attributes) != 0 {
+		metrics.quorumParticipation.Record(context.Background(),
+			float64(q.sendersTotalPower)/float64(q.powerTable.ScaledTotal),
+			metric.WithAttributes(q.attributes...))
+	}
 	return senderPower, true
 }
 
@@ -1172,10 +1135,43 @@ func (q *quorumState) ReceivedFromWeakQuorum() bool {
 	return hasWeakQuorum(q.sendersTotalPower, q.powerTable.ScaledTotal)
 }
 
-// Checks whether a chain has reached a strong quorum.
+// HasStrongQuorumFor checks whether a chain has reached a strong quorum.
 func (q *quorumState) HasStrongQuorumFor(key ECChainKey) bool {
 	supportForChain, ok := q.chainSupport[key]
 	return ok && supportForChain.hasStrongQuorum
+}
+
+// HasJustificationOf checks whether a justification for a chain key exists.
+//
+// See: GetJustificationOf for details on how the key is interpreted.
+func (q *quorumState) HasJustificationOf(phase Phase, key ECChainKey) bool {
+	return q.GetJustificationOf(phase, key) != nil
+}
+
+// GetJustificationOf gets the justification for a chain or nil if no such
+// justification exists. The given key may be zero, in which case the first
+// justification for bottom that is found is returned.
+func (q *quorumState) GetJustificationOf(phase Phase, key ECChainKey) *Justification {
+
+	// The justification vote value is either zero or matches the vote value. If the
+	// given key is zero, it indicates that the ask is for the justification of
+	// bottom. Iterate through the list of received justification to find a
+	// match.
+	//
+	// Otherwise, simply use the receivedJustification map keyed by vote value.
+	if key.IsZero() {
+		for _, justification := range q.receivedJustification {
+			if justification.Vote.Value.IsZero() && justification.Vote.Phase == phase {
+				return justification
+			}
+		}
+		return nil
+	}
+	justification, found := q.receivedJustification[key]
+	if found && justification.Vote.Phase == phase {
+		return justification
+	}
+	return nil
 }
 
 // CouldReachStrongQuorumFor checks whether the given chain can possibly reach
@@ -1310,6 +1306,10 @@ type convergeState struct {
 	senders map[ActorID]struct{}
 	// Chains indexed by key.
 	values map[ECChainKey]ConvergeValue
+
+	// sendersTotalPower is only used for metrics reporting
+	sendersTotalPower int64
+	attributes        []attribute.KeyValue
 }
 
 // ConvergeValue is valid when the Chain is non-zero and Justification is non-nil
@@ -1328,10 +1328,11 @@ func (cv *ConvergeValue) IsValid() bool {
 	return !cv.Chain.IsZero() && cv.Justification != nil
 }
 
-func newConvergeState() *convergeState {
+func newConvergeState(attributes ...attribute.KeyValue) *convergeState {
 	return &convergeState{
-		senders: map[ActorID]struct{}{},
-		values:  map[ECChainKey]ConvergeValue{},
+		senders:    map[ActorID]struct{}{},
+		values:     map[ECChainKey]ConvergeValue{},
+		attributes: append([]attribute.KeyValue{attrConvergePhase}, attributes...),
 	}
 }
 
@@ -1366,6 +1367,11 @@ func (c *convergeState) Receive(sender ActorID, table *PowerTable, value *ECChai
 	}
 	c.senders[sender] = struct{}{}
 	senderPower, _ := table.Get(sender)
+	c.sendersTotalPower += senderPower
+
+	metrics.quorumParticipation.Record(context.Background(),
+		float64(c.sendersTotalPower)/float64(table.ScaledTotal),
+		metric.WithAttributes(c.attributes...))
 
 	key := value.Key()
 	// Keep only the first justification and best ticket.
@@ -1418,6 +1424,38 @@ func (c *convergeState) FindProposalFor(chain *ECChain) ConvergeValue {
 
 	// Default converge value is not valid
 	return ConvergeValue{}
+}
+
+// HasJustificationOf checks whether a justification for a chain key exists.
+//
+// See: GetJustificationOf for details on how the key is interpreted.
+func (c *convergeState) HasJustificationOf(phase Phase, key ECChainKey) bool {
+	return c.GetJustificationOf(phase, key) != nil
+}
+
+// GetJustificationOf gets the justification for a chain or nil if no such
+// justification exists. The given key may be zero, in which case the first
+// justification for bottom that is found is returned.
+func (c *convergeState) GetJustificationOf(phase Phase, key ECChainKey) *Justification {
+
+	// The justification vote value is either zero or matches the vote value. If the
+	// given key is zero, it indicates that the ask is for the justification of
+	// bottom. Iterate through the converge values to find a match.
+	//
+	// Otherwise, simply use the values map keyed by vote value.
+	if key.IsZero() {
+		for _, value := range c.values {
+			if value.Justification.Vote.Value.IsZero() && value.Justification.Vote.Phase == phase {
+				return value.Justification
+			}
+		}
+		return nil
+	}
+	value, found := c.values[key]
+	if found && value.Justification.Vote.Phase == phase {
+		return value.Justification
+	}
+	return nil
 }
 
 ///// General helpers /////

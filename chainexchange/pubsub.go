@@ -40,7 +40,7 @@ type PubSubChainExchange struct {
 	pendingCacheAsWanted chan Message
 	topic                *pubsub.Topic
 	stop                 func() error
-	encoding             *encoding.ZSTD[*Message]
+	encoding             encoding.EncodeDecoder[*Message]
 }
 
 func NewPubSubChainExchange(o ...Option) (*PubSubChainExchange, error) {
@@ -48,16 +48,21 @@ func NewPubSubChainExchange(o ...Option) (*PubSubChainExchange, error) {
 	if err != nil {
 		return nil, err
 	}
-	zstd, err := encoding.NewZSTD[*Message]()
-	if err != nil {
-		return nil, err
+	var enc encoding.EncodeDecoder[*Message]
+	if !opts.compression {
+		enc = encoding.NewCBOR[*Message]()
+	} else {
+		enc, err = encoding.NewZSTD[*Message]()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &PubSubChainExchange{
 		options:              opts,
 		chainsWanted:         map[uint64]*lru.Cache[gpbft.ECChainKey, *chainPortion]{},
 		chainsDiscovered:     map[uint64]*lru.Cache[gpbft.ECChainKey, *chainPortion]{},
 		pendingCacheAsWanted: make(chan Message, 100), // TODO: parameterise.
-		encoding:             zstd,
+		encoding:             enc,
 	}, nil
 }
 
@@ -229,16 +234,26 @@ func (p *PubSubChainExchange) validatePubSubMessage(ctx context.Context, _ peer.
 		cmsg.Instance > current.ID+p.maxInstanceLookahead:
 		// Too far ahead or too far behind.
 		return pubsub.ValidationIgnore
+	case current.Input != nil && cmsg.Instance == current.ID:
+		// The input chain in current progress may be nil when the next instance is
+		// scheduled to start, but the input chain is not yet known, that is, calls to
+		// StartInstanceAt. Hence, the check for input presence.
+		currentBase := current.Input.Base()
+		msgBase := cmsg.Chain.Base()
+		if !msgBase.Equal(currentBase) {
+			log.Debugw("Invalid chain with mismatching base tipset for instance", "from", msg.GetFrom(), "instance", current.ID, "expectedBase", currentBase, "gotBase", msgBase)
+			return pubsub.ValidationReject
+		}
 	}
-	now := time.Now().Unix()
-	lowerBound := now - int64(p.maxTimestampAge.Seconds())
+	now := p.clk.Now().UnixMilli()
+	lowerBound := now - p.maxTimestampAge.Milliseconds()
 	if lowerBound > cmsg.Timestamp || cmsg.Timestamp > now {
 		// The timestamp is too old or too far ahead. Ignore the message to avoid
 		// affecting peer scores.
+		log.Debugw("Timestamp too old or too far ahead", "from", msg.GetFrom(), "timestamp", cmsg.Timestamp, "lowerBound", lowerBound)
 		return pubsub.ValidationIgnore
 	}
-	// TODO: wire in the current base chain from an on-going instance to further
-	//       tighten up validation.
+
 	msg.ValidatorData = cmsg
 	return pubsub.ValidationAccept
 }
@@ -248,11 +263,11 @@ func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg M
 	wanted := p.getChainsDiscoveredAt(ctx, cmsg.Instance)
 	discovered := p.getChainsDiscoveredAt(ctx, cmsg.Instance)
 
-	for offset := cmsg.Chain.Len(); offset >= 0 && ctx.Err() == nil; offset-- {
-		// TODO: Expose internals of merkle.go so that keys can be generated
-		//       cumulatively for a more efficient prefix chain key generation.
-		prefix := cmsg.Chain.Prefix(offset)
+	allPrefixes := cmsg.Chain.AllPrefixes()
+	for i := len(allPrefixes) - 1; i >= 0 && ctx.Err() == nil; i-- {
+		prefix := allPrefixes[i]
 		key := prefix.Key()
+
 		if portion, found := wanted.Peek(key); !found {
 			// Not a wanted key; add it to discovered chains if they are not there already,
 			// i.e. without modifying the recent-ness of any of the discovered values.
@@ -314,11 +329,12 @@ type discovery struct {
 func (p *PubSubChainExchange) cacheAsWantedChain(ctx context.Context, cmsg Message) {
 	var notifications []discovery
 	wanted := p.getChainsWantedAt(ctx, cmsg.Instance)
-	for offset := cmsg.Chain.Len(); offset >= 0 && ctx.Err() == nil; offset-- {
-		// TODO: Expose internals of merkle.go so that keys can be generated
-		//       cumulatively for a more efficient prefix chain key generation.
-		prefix := cmsg.Chain.Prefix(offset)
+
+	allPrefixes := cmsg.Chain.AllPrefixes()
+	for i := len(allPrefixes) - 1; i >= 0 && ctx.Err() == nil; i-- {
+		prefix := allPrefixes[i]
 		key := prefix.Key()
+
 		if portion, found := wanted.Peek(key); !found || portion.IsPlaceholder() {
 			wanted.Add(key, &chainPortion{
 				chain: prefix,

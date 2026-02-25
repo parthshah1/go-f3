@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/filecoin-project/go-f3"
 	"github.com/filecoin-project/go-f3/certexchange"
 	"github.com/filecoin-project/go-f3/certs"
+	"github.com/filecoin-project/go-f3/certstore"
 	"github.com/filecoin-project/go-f3/chainexchange"
 	"github.com/filecoin-project/go-f3/gpbft"
 	gen "github.com/whyrusleeping/cbor-gen"
@@ -22,6 +22,7 @@ func main() {
 			gpbft.TipSet{},
 			gpbft.LegacyECChain{},
 			gpbft.GMessage{},
+			gpbft.PartialGMessage{},
 			gpbft.SupplementalData{},
 			gpbft.Payload{},
 			gpbft.Justification{},
@@ -48,8 +49,8 @@ func main() {
 		)
 	})
 	eg.Go(func() error {
-		return gen.WriteTupleEncodersToFile("../cbor_gen.go", "f3",
-			f3.PartialGMessage{},
+		return gen.WriteTupleEncodersToFile("../certstore/cbor_gen.go", "certstore",
+			certstore.SnapshotHeader{},
 		)
 	})
 	if err := eg.Wait(); err != nil {

@@ -24,6 +24,7 @@ func TestCertChain_GenerateAndVerify(t *testing.T) {
 
 	ctx, clk := clock.WithMockClock(context.Background())
 	m := manifest.LocalDevnetManifest()
+	m.InitialInstance = 100
 	signVerifier := signing.NewFakeBackend()
 	rng := rand.New(rand.NewSource(seed * 23))
 	generatePublicKey := func(id gpbft.ActorID) gpbft.PubKey {
@@ -35,7 +36,8 @@ func TestCertChain_GenerateAndVerify(t *testing.T) {
 	}
 	initialPowerTable := generatePowerTable(t, rng, generatePublicKey, nil)
 
-	ec := consensus.NewFakeEC(ctx,
+	ec := consensus.NewFakeEC(
+		consensus.WithClock(clk),
 		consensus.WithSeed(seed*13),
 		consensus.WithBootstrapEpoch(m.BootstrapEpoch),
 		consensus.WithECPeriod(m.EC.Period),
@@ -73,7 +75,7 @@ func TestCertChain_GenerateAndVerify(t *testing.T) {
 	generatedChain, err := subject.Generate(ctx, certChainLength)
 	require.NoError(t, err)
 
-	initialCommittee, err := subject.GetCommittee(m.InitialInstance)
+	initialCommittee, err := subject.GetCommittee(ctx, m.InitialInstance)
 	require.NoError(t, err)
 
 	nextInstance, _, _, err := certs.ValidateFinalityCertificates(

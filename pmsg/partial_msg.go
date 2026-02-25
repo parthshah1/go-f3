@@ -1,4 +1,4 @@
-package f3
+package pmsg
 
 import (
 	"context"
@@ -7,19 +7,19 @@ import (
 
 	"github.com/filecoin-project/go-f3/chainexchange"
 	"github.com/filecoin-project/go-f3/gpbft"
+	"github.com/filecoin-project/go-f3/internal/clock"
 	"github.com/filecoin-project/go-f3/manifest"
 	lru "github.com/hashicorp/golang-lru/v2"
+	logging "github.com/ipfs/go-log/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
-var _ chainexchange.Listener = (*partialMessageManager)(nil)
-
-type PartialGMessage struct {
-	*gpbft.GMessage
-	VoteValueKey gpbft.ECChainKey `cborgen:"maxlen=32"`
-}
+var (
+	log                        = logging.Logger("f3")
+	_   chainexchange.Listener = (*PartialMessageManager)(nil)
+)
 
 type partialMessageKey struct {
 	sender  gpbft.ActorID
@@ -31,17 +31,17 @@ type discoveredChain struct {
 	chain    *gpbft.ECChain
 }
 
-type partialMessageManager struct {
+type PartialMessageManager struct {
 	chainex *chainexchange.PubSubChainExchange
 
 	// pmByInstance is a map of instance to a buffer of partial messages that are
 	// keyed by sender+instance+round+phase.
-	pmByInstance map[uint64]*lru.Cache[partialMessageKey, *PartiallyValidatedMessage]
+	pmByInstance map[uint64]*lru.Cache[partialMessageKey, gpbft.PartiallyValidatedMessage]
 	// pmkByInstanceByChainKey is used for an auxiliary lookup of all partial
 	// messages for a given vote value at an instance.
 	pmkByInstanceByChainKey map[uint64]map[gpbft.ECChainKey][]partialMessageKey
 	// pendingPartialMessages is a channel of partial messages that are pending to be buffered.
-	pendingPartialMessages chan *PartiallyValidatedMessage
+	pendingPartialMessages chan gpbft.PartiallyValidatedMessage
 	// pendingDiscoveredChains is a channel of chains discovered by chainexchange
 	// that are pending to be processed.
 	pendingDiscoveredChains chan *discoveredChain
@@ -51,22 +51,31 @@ type partialMessageManager struct {
 	pendingInstanceRemoval chan uint64
 	// rebroadcastInterval is the interval at which chains are re-broadcasted.
 	rebroadcastInterval time.Duration
+	// maxBuffMsgPerInstance is the maximum number of buffered partial messages per instance.
+	maxBuffMsgPerInstance int
+	// completedMsgsBufSize is the size of the buffer for completed messages channel.
+	completedMsgsBufSize int
+	clk                  clock.Clock
 
 	stop func()
 }
 
-func newPartialMessageManager(progress gpbft.Progress, ps *pubsub.PubSub, m *manifest.Manifest) (*partialMessageManager, error) {
-	pmm := &partialMessageManager{
-		pmByInstance:            make(map[uint64]*lru.Cache[partialMessageKey, *PartiallyValidatedMessage]),
+func NewPartialMessageManager(progress gpbft.Progress, ps *pubsub.PubSub, m manifest.Manifest, clk clock.Clock) (*PartialMessageManager, error) {
+	pmm := &PartialMessageManager{
+		pmByInstance:            make(map[uint64]*lru.Cache[partialMessageKey, gpbft.PartiallyValidatedMessage]),
 		pmkByInstanceByChainKey: make(map[uint64]map[gpbft.ECChainKey][]partialMessageKey),
-		pendingDiscoveredChains: make(chan *discoveredChain, 100),           // TODO: parameterize buffer size.
-		pendingPartialMessages:  make(chan *PartiallyValidatedMessage, 100), // TODO: parameterize buffer size.
-		pendingChainBroadcasts:  make(chan chainexchange.Message, 100),      // TODO: parameterize buffer size.
-		pendingInstanceRemoval:  make(chan uint64, 10),
+		pendingDiscoveredChains: make(chan *discoveredChain, m.PartialMessageManager.PendingDiscoveredChainsBufferSize),
+		pendingPartialMessages:  make(chan gpbft.PartiallyValidatedMessage, m.PartialMessageManager.PendingPartialMessagesBufferSize),
+		pendingChainBroadcasts:  make(chan chainexchange.Message, m.PartialMessageManager.PendingChainBroadcastsBufferSize),
+		pendingInstanceRemoval:  make(chan uint64, m.PartialMessageManager.PendingInstanceRemovalBufferSize),
 		rebroadcastInterval:     m.ChainExchange.RebroadcastInterval,
+		maxBuffMsgPerInstance:   m.PartialMessageManager.MaxBufferedMessagesPerInstance,
+		completedMsgsBufSize:    m.PartialMessageManager.CompletedMessagesBufferSize,
+		clk:                     clk,
 	}
 	var err error
 	pmm.chainex, err = chainexchange.NewPubSubChainExchange(
+		chainexchange.WithCompression(m.PubSub.ChainCompressionEnabled),
 		chainexchange.WithListener(pmm),
 		chainexchange.WithProgress(progress),
 		chainexchange.WithPubSub(ps),
@@ -77,6 +86,7 @@ func newPartialMessageManager(progress gpbft.Progress, ps *pubsub.PubSub, m *man
 		chainexchange.WithMaxTimestampAge(m.ChainExchange.MaxTimestampAge),
 		chainexchange.WithSubscriptionBufferSize(m.ChainExchange.SubscriptionBufferSize),
 		chainexchange.WithTopicName(manifest.ChainExchangeTopicFromNetworkName(m.NetworkName)),
+		chainexchange.WithClock(clk),
 	)
 	if err != nil {
 		return nil, err
@@ -84,12 +94,12 @@ func newPartialMessageManager(progress gpbft.Progress, ps *pubsub.PubSub, m *man
 	return pmm, nil
 }
 
-func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyValidatedMessage, error) {
+func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.PartiallyValidatedMessage, error) {
 	if err := pmm.chainex.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting chain exchange: %w", err)
 	}
 
-	completedMessages := make(chan *PartiallyValidatedMessage, 100) // TODO: parameterize buffer size.
+	completedMessages := make(chan gpbft.PartiallyValidatedMessage, pmm.completedMsgsBufSize)
 	ctx, pmm.stop = context.WithCancel(context.Background())
 	go func() {
 		defer func() {
@@ -121,22 +131,40 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 				}
 				buffer := pmm.getOrInitPartialMessageBuffer(discovered.instance)
 				for _, messageKey := range partialMessageKeys {
-					if pgmsg, found := buffer.Get(messageKey); found {
+					if pvgmsg, found := buffer.Get(messageKey); found {
+						pgmsg := pvgmsg.PartialMessage()
 						pgmsg.Vote.Value = discovered.chain
-						inferJustificationVoteValue(pgmsg.PartialGMessage)
+						inferJustificationVoteValue(pgmsg)
 						select {
 						case <-ctx.Done():
 							return
-						case completedMessages <- pgmsg:
+						case completedMessages <- pvgmsg:
 						default:
-							log.Warnw("Dropped completed message as the gpbft runner is too slow to consume them.", "msg", pgmsg.GMessage)
+							// The gpbft runner is too slow to consume the completed messages. Drop the
+							// earliest unconsumed message to make room for the new one. This is a trade-off
+							// between preferring eventual progress versus full message delivery while
+							// keeping a capped memory usage.
+							log.Warn("The gpbft runner is too slow to consume completed messages.")
+							select {
+							case <-ctx.Done():
+								return
+							case dropped := <-completedMessages:
+								metrics.partialMessagesDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", "completed_message")))
+								select {
+								case <-ctx.Done():
+									return
+								case completedMessages <- pvgmsg:
+									log.Warnw("Dropped earliest completed message to add the latest as the gpbft runner is too slow to consume them.", "added", pgmsg.GMessage, "dropped", dropped)
+								}
+							}
 						}
 						buffer.Remove(messageKey)
 						metrics.partialMessages.Add(ctx, -1)
 					}
 				}
 				delete(partialMessageKeysAtInstance, chainkey)
-			case pgmsg, ok := <-pmm.pendingPartialMessages:
+			case pvgmsg, ok := <-pmm.pendingPartialMessages:
+				pgmsg := pvgmsg.PartialMessage()
 				if !ok {
 					return
 				}
@@ -149,7 +177,7 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 					},
 				}
 				buffer := pmm.getOrInitPartialMessageBuffer(pgmsg.Vote.Instance)
-				if known, found, _ := buffer.PeekOrAdd(key, pgmsg); !found {
+				if known, found, _ := buffer.PeekOrAdd(key, pvgmsg); !found {
 					pmkByChainKey := pmm.pmkByInstanceByChainKey[pgmsg.Vote.Instance]
 					pmkByChainKey[pgmsg.VoteValueKey] = append(pmkByChainKey[pgmsg.VoteValueKey], key)
 					metrics.partialMessages.Add(ctx, 1)
@@ -157,7 +185,7 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 					// The message is a duplicate. This can happen when a message is re-broadcasted.
 					// But the vote value key must remain consistent for the same instance, sender,
 					// round and phase. If it's not, then it's an equivocation.
-					equivocation := known.VoteValueKey != pgmsg.VoteValueKey
+					equivocation := known.PartialMessage().VoteValueKey != pgmsg.VoteValueKey
 					metrics.partialMessageDuplicates.Add(ctx, 1,
 						metric.WithAttributes(attribute.Bool("equivocation", equivocation)))
 				}
@@ -187,7 +215,7 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 	// Use a dedicated goroutine for chain broadcast to avoid any delay in
 	// broadcasting chains as it can fundamentally affect progress across the system.
 	go func() {
-		ticker := time.NewTicker(pmm.rebroadcastInterval)
+		ticker := pmm.clk.Ticker(pmm.rebroadcastInterval)
 		defer func() {
 			ticker.Stop()
 			log.Debugw("Partial message manager rebroadcast stopped.")
@@ -200,7 +228,7 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 				return
 			case t := <-ticker.C:
 				if current != nil {
-					current.Timestamp = roundDownToUnixTime(t, pmm.rebroadcastInterval)
+					current.Timestamp = roundDownToUnixMilliTime(t, pmm.rebroadcastInterval)
 					if err := pmm.chainex.Broadcast(ctx, *current); err != nil {
 						log.Debugw("Failed to re-broadcast chain.", "instance", current.Instance, "chain", current.Chain, "error", err)
 					}
@@ -215,7 +243,7 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 					// Broadcast immediately and reset the timer to tick from now onwards. This is to
 					// re-align the chain rebroadcast relative to instance start.
 					current = &pending
-					current.Timestamp = roundDownToUnixTime(time.Now(), pmm.rebroadcastInterval)
+					current.Timestamp = roundDownToUnixMilliTime(pmm.clk.Now(), pmm.rebroadcastInterval)
 					if err := pmm.chainex.Broadcast(ctx, *current); err != nil {
 						log.Debugw("Failed to immediately re-broadcast chain.", "instance", current.Instance, "chain", current.Chain, "error", err)
 					}
@@ -242,29 +270,50 @@ func (pmm *partialMessageManager) Start(ctx context.Context) (<-chan *PartiallyV
 	return completedMessages, nil
 }
 
-func roundDownToUnixTime(t time.Time, interval time.Duration) int64 {
-	return (t.Unix() / int64(interval)) * int64(interval)
+func roundDownToUnixMilliTime(t time.Time, interval time.Duration) int64 {
+	intervalMilli := interval.Milliseconds()
+	if intervalMilli <= 0 {
+		log.Errorw("Invalid rebroadcast interval, must be greater than 1 millisecond.", "interval", intervalMilli)
+		return 0
+	}
+	return (t.UnixMilli() / intervalMilli) * intervalMilli
 }
 
-func (pmm *partialMessageManager) BroadcastChain(ctx context.Context, instance uint64, chain *gpbft.ECChain) error {
+func (pmm *PartialMessageManager) BroadcastChain(ctx context.Context, instance uint64, chain *gpbft.ECChain) error {
 	if chain.IsZero() {
 		return nil
 	}
+	msg := chainexchange.Message{Instance: instance, Chain: chain}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case pmm.pendingChainBroadcasts <- chainexchange.Message{Instance: instance, Chain: chain}:
+	case pmm.pendingChainBroadcasts <- msg:
 	default:
-		// The chain broadcast is too slow. Drop the request and rely on GPBFT
-		// re-broadcast to request chain broadcast again instead of blocking.
-		log.Debugw("Dropped chain broadcast as chain rebroadcast is too slow.", "instance", instance, "chain", chain)
+		// The chain broadcast is too slow. Drop the earliest unprocessed request and
+		// rely on GPBFT re-broadcast to request chain broadcast again instead of
+		// blocking. The rationale for dropping the earliest is that the chances are
+		// later messages are more informative for the network and later ones. If we are
+		// slow in processing, the chances are we are behind.
+		log.Debugw("The chain rebroadcast is too slow.", "instance", instance, "chain", chain)
+		select {
+		case <-ctx.Done():
+			return nil
+		case dropped := <-pmm.pendingChainBroadcasts:
+			metrics.partialMessagesDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", "chain_broadcast")))
+			select {
+			case <-ctx.Done():
+				return nil
+			case pmm.pendingChainBroadcasts <- msg:
+				log.Warnw("Dropped earliest chain broadcast request to the latest as the chain broadcast is too slow to consume them.", "added", msg, "dropped", dropped)
+			}
+		}
 	}
 	return nil
 }
 
-func (pmm *partialMessageManager) toPartialGMessage(msg *gpbft.GMessage) (*PartialGMessage, error) {
+func (pmm *PartialMessageManager) ToPartialGMessage(msg *gpbft.GMessage) (*gpbft.PartialGMessage, error) {
 	msgCopy := *(msg)
-	pmsg := &PartialGMessage{
+	pmsg := &gpbft.PartialGMessage{
 		GMessage: &msgCopy,
 	}
 	if !pmsg.Vote.Value.IsZero() {
@@ -294,7 +343,7 @@ func (pmm *partialMessageManager) toPartialGMessage(msg *gpbft.GMessage) (*Parti
 	return pmsg, nil
 }
 
-func (pmm *partialMessageManager) NotifyChainDiscovered(ctx context.Context, instance uint64, chain *gpbft.ECChain) {
+func (pmm *PartialMessageManager) NotifyChainDiscovered(ctx context.Context, instance uint64, chain *gpbft.ECChain) {
 	discovery := &discoveredChain{instance: instance, chain: chain}
 	select {
 	case <-ctx.Done():
@@ -309,7 +358,7 @@ func (pmm *partialMessageManager) NotifyChainDiscovered(ctx context.Context, ins
 	}
 }
 
-func (pmm *partialMessageManager) bufferPartialMessage(ctx context.Context, msg *PartiallyValidatedMessage) {
+func (pmm *PartialMessageManager) BufferPartialMessage(ctx context.Context, msg gpbft.PartiallyValidatedMessage) {
 	select {
 	case <-ctx.Done():
 		return
@@ -323,14 +372,11 @@ func (pmm *partialMessageManager) bufferPartialMessage(ctx context.Context, msg 
 	}
 }
 
-func (pmm *partialMessageManager) getOrInitPartialMessageBuffer(instance uint64) *lru.Cache[partialMessageKey, *PartiallyValidatedMessage] {
+func (pmm *PartialMessageManager) getOrInitPartialMessageBuffer(instance uint64) *lru.Cache[partialMessageKey, gpbft.PartiallyValidatedMessage] {
 	buffer, found := pmm.pmByInstance[instance]
 	if !found {
-		// TODO: parameterize this in the manifest?
-		// Based on 5 phases, 2K network size at a couple of rounds plus some headroom.
-		const maxBufferedMessagesPerInstance = 25_000
 		var err error
-		buffer, err = lru.New[partialMessageKey, *PartiallyValidatedMessage](maxBufferedMessagesPerInstance)
+		buffer, err = lru.New[partialMessageKey, gpbft.PartiallyValidatedMessage](pmm.maxBuffMsgPerInstance)
 		if err != nil {
 			log.Fatalf("Failed to create buffer for instance %d: %s", instance, err)
 			panic(err)
@@ -344,7 +390,7 @@ func (pmm *partialMessageManager) getOrInitPartialMessageBuffer(instance uint64)
 	return buffer
 }
 
-func (pmm *partialMessageManager) CompleteMessage(ctx context.Context, pgmsg *PartialGMessage) (*gpbft.GMessage, bool) {
+func (pmm *PartialMessageManager) CompleteMessage(ctx context.Context, pgmsg *gpbft.PartialGMessage) (*gpbft.GMessage, bool) {
 	if pgmsg == nil {
 		// For sanity assert that the message isn't nil.
 		return nil, false
@@ -364,7 +410,7 @@ func (pmm *partialMessageManager) CompleteMessage(ctx context.Context, pgmsg *Pa
 	return pgmsg.GMessage, true
 }
 
-func inferJustificationVoteValue(pgmsg *PartialGMessage) {
+func inferJustificationVoteValue(pgmsg *gpbft.PartialGMessage) {
 	// Infer what the value of justification should be based on the vote phase. A
 	// valid message with non-nil justification must justify the vote value chain
 	// at:
@@ -395,7 +441,7 @@ func inferJustificationVoteValue(pgmsg *PartialGMessage) {
 	}
 }
 
-func (pmm *partialMessageManager) RemoveMessagesBeforeInstance(ctx context.Context, instance uint64) {
+func (pmm *PartialMessageManager) RemoveMessagesBeforeInstance(ctx context.Context, instance uint64) {
 	select {
 	case <-ctx.Done():
 		return
@@ -405,7 +451,7 @@ func (pmm *partialMessageManager) RemoveMessagesBeforeInstance(ctx context.Conte
 	}
 }
 
-func (pmm *partialMessageManager) Shutdown(ctx context.Context) error {
+func (pmm *PartialMessageManager) Shutdown(ctx context.Context) error {
 	if pmm.stop != nil {
 		pmm.stop()
 	}

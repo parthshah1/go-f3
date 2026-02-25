@@ -40,18 +40,23 @@ var (
 	attrCacheMiss              = attribute.String("cache", "miss")
 	attrCacheKindMessage       = attribute.String("kind", "message")
 	attrCacheKindJustification = attribute.String("kind", "justification")
+	attrPartial                = func(partial bool) attribute.KeyValue { return attribute.Bool("partial", partial) }
+	attrKeyRound               = attribute.Key("round")
 
 	metrics = struct {
-		phaseCounter       metric.Int64Counter
-		roundHistogram     metric.Int64Histogram
-		broadcastCounter   metric.Int64Counter
-		reBroadcastCounter metric.Int64Counter
-		errorCounter       metric.Int64Counter
-		currentInstance    metric.Int64Gauge
-		currentRound       metric.Int64Gauge
-		currentPhase       metric.Int64Gauge
-		skipCounter        metric.Int64Counter
-		validationCache    metric.Int64Counter
+		phaseCounter        metric.Int64Counter
+		roundHistogram      metric.Int64Histogram
+		broadcastCounter    metric.Int64Counter
+		reBroadcastCounter  metric.Int64Counter
+		errorCounter        metric.Int64Counter
+		currentInstance     metric.Int64Gauge
+		currentRound        metric.Int64Gauge
+		currentPhase        metric.Int64Gauge
+		proposalLength      metric.Int64Gauge
+		skipCounter         metric.Int64Counter
+		validationCache     metric.Int64Counter
+		quorumParticipation metric.Float64Gauge
+		totalPower          metric.Float64Gauge
 	}{
 		phaseCounter: measurements.Must(meter.Int64Counter("f3_gpbft_phase_counter", metric.WithDescription("Number of times phases change"))),
 		roundHistogram: measurements.Must(meter.Int64Histogram("f3_gpbft_round_histogram",
@@ -66,10 +71,14 @@ var (
 		currentPhase: measurements.Must(meter.Int64Gauge("f3_gpbft_current_phase",
 			metric.WithDescription("The current phase represented as numeric value of gpbft.Phase: "+
 				"0=INITIAL, 1=QUALITY, 2=CONVERGE, 3=PREPARE, 4=COMMIT, 5=DECIDE, and 6=TERMINATED"))),
-		skipCounter: measurements.Must(meter.Int64Counter("f3_gpbft_skip_counter",
-			metric.WithDescription("The number of times GPBFT skip either round or phase"))),
-		validationCache: measurements.Must(meter.Int64Counter("f3_gpbft_validation_cache",
-			metric.WithDescription("The number of times GPBFT validation cache resulted in hit or miss."))),
+		proposalLength: measurements.Must(meter.Int64Gauge("f3_gpbft_current_proposal_len",
+			metric.WithDescription("Length of active proposal"))),
+		skipCounter:     measurements.Must(meter.Int64Counter("f3_gpbft_skip_counter", metric.WithDescription("The number of times GPBFT skip either round or phase"))),
+		validationCache: measurements.Must(meter.Int64Counter("f3_gpbft_validation_cache", metric.WithDescription("The number of times GPBFT validation cache resulted in hit or miss."))),
+		quorumParticipation: measurements.Must(meter.Float64Gauge("f3_gpbft_participation",
+			metric.WithDescription("The current ratio of participation at a given round and phase (converge not tracked)."))),
+		totalPower: measurements.Must(meter.Float64Gauge("f3_gpbft_total_power",
+			metric.WithDescription("The size of the power table as observed by gpbft."))),
 	}
 )
 
